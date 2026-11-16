@@ -4,6 +4,7 @@ import { api, downloadFile, errorMessage, go, type RecordData, type Run, useApi,
 import { DataTable, Empty, ErrorBox, Field, JsonView, Loading, MetricGrid, PageHead, Pagination, Panel, RunTable, SearchInput, Status, Tabs, Tag, TimeChart, fmt, dateTime } from './components';
 import { ALPHA101_CODE, calculateFundamental, DRAFT_KEY, eventWindow, ipoQuota, parseMarketValues, operatorCode, SOURCES, VERIFIED_AT, type MarketName, type PublicMarket } from './researchTools';
 
+import { AIWorkbench } from './AIWorkbench';
 import type { OperatorDefinition, OperatorInput, OperatorParameter } from './operatorCatalog';
 
 type Props = { notify: (message: string) => void };
@@ -83,8 +84,8 @@ export function OperatorLibrary({ notify }: Props) {
         const factor = await api('/factors', 'POST', { name: selected.name + ' · 因子模板', category: '算子模板', description: `${selected.description}\n目录定义：${selected.id} v${selected.version}\n来源：${selected.sourceLabel} ${selected.source}\n时间口径：${selected.timing}`, code });
         notify('已从当前算子版本创建可编辑因子。'); go('/factors/' + factor.id);
       } else {
-        localStorage.setItem(DRAFT_KEY, JSON.stringify({ sourceTitle: selected.sourceLabel, sourceUrl: selected.source, name: selected.name, definition: `${selected.formula}\n${selected.timing}\n目录：${selected.id} v${selected.version}`, code, sourceRegistered: false, confirmed: false }));
-        go('/replication?new=1'); notify('已展开公式模板，请核对来源和研究口径。');
+        localStorage.setItem(DRAFT_KEY, JSON.stringify({ sourceTitle: selected.sourceLabel, sourceUrl: selected.source, name: selected.name, definition: `${selected.formula}\n${selected.timing}\n目录：${selected.id} v${selected.version}`, code, sourceRegistered: false, confirmed: false, handoff: 'operator_template', operator_ids: [selected.id], operator_refs: [{ id: selected.id, version: selected.version }] }));
+        go('/replication?new=1&template=1'); notify('算子和研究说明已带入；请先预览外发内容。');
       }
     } catch (e) { setError(errorMessage(e)); } finally { setBusy(''); }
   }
@@ -179,7 +180,8 @@ export function EventResearch({ notify }: Props) {
 
 const initialDraft = { sourceTitle: '101 Formulaic Alphas · Zura Kakushadze', sourceUrl: SOURCES.alpha, name: 'Alpha101 #101 复现', definition: 'Alpha#101 = (close − open) / ((high − low) + 0.001)。当日OHLC收盘后完整可得，最早次日交易；不预设有效性。', code: ALPHA101_CODE, sourceRegistered: false, confirmed: false, factorId: '', runId: '', reportId: '' };
 function readDraft(): typeof initialDraft { try { return { ...initialDraft, ...JSON.parse(localStorage.getItem(DRAFT_KEY) || '{}') }; } catch { return initialDraft; } }
-export function ReplicationPipeline({ notify }: Props) {
+export function ReplicationPipeline({ notify }: Props) { return <AIWorkbench notify={notify} oldView={<ManualReplicationPipeline notify={notify}/>}/>; }
+function ManualReplicationPipeline({ notify }: Props) {
   const route = useRoute();
   const [view, setView] = useState(() => window.location.hash.includes('new=1') ? 'new' : 'tasks');
   const [taskSearch, setTaskSearch] = useState('');
@@ -200,7 +202,7 @@ export function ReplicationPipeline({ notify }: Props) {
       if (kind === 'validate') { const v = await api('/factors/validate', 'POST', { code: draft.code }); setValidation(v); if (!v.valid) throw new Error((v.errors || []).join('；') || 'AST校验未通过'); notify('AST校验通过，尚未保存或产生任何业绩。'); }
       if (kind === 'save') {
         const v = await api('/factors/validate', 'POST', { code: draft.code }); setValidation(v); if (!v.valid) throw new Error((v.errors || []).join('；'));
-        const f = await api('/factors', 'POST', { name: draft.name, category: '文献复现', description: `来源：${draft.sourceTitle}\n${draft.sourceUrl}\n人工确认定义：${draft.definition}\n模式：人工确认+规则辅助AST，未连接语言模型。`, code: v.code || draft.code });
+        const f = await api('/factors', 'POST', { name: draft.name, category: '文献复现', description: `来源：${draft.sourceTitle}\n${draft.sourceUrl}\n人工确认定义：${draft.definition}\n模式：人工确认+规则辅助AST，未调用语言模型。`, code: v.code || draft.code });
         persist({ ...draft, factorId: f.id, runId: '', reportId: '' }); notify('已保存真实因子版本。');
       }
       if (kind === 'run') {
@@ -210,16 +212,16 @@ export function ReplicationPipeline({ notify }: Props) {
       }
       if (kind === 'report') {
         if (!run || run.status !== 'completed' || !run.result) throw new Error('任务尚未完成，不能生成结果报告。');
-        const body = `来源：${draft.sourceTitle}\n${draft.sourceUrl}\n\n人工确认定义：\n${draft.definition}\n\n因子：${draft.factorId}\n研究任务：${run.id}\n数据/算法模式：${isPublic ? '公开数据浏览器计算' : '后端研究引擎'}\n\n实际指标：\n${JSON.stringify(run.result.metrics, null, 2)}\n\n研究结论（人工填写）：\n${conclusion}\n\n结果限制：\n${(run.result.warnings || []).join('\n')}\n\n未使用未连接的语言模型生成收益或结论。`;
+        const body = `来源：${draft.sourceTitle}\n${draft.sourceUrl}\n\n人工确认定义：\n${draft.definition}\n\n因子：${draft.factorId}\n研究任务：${run.id}\n数据/算法模式：${isPublic ? '公开数据浏览器计算' : '后端研究引擎'}\n\n实际指标：\n${JSON.stringify(run.result.metrics, null, 2)}\n\n研究结论（人工填写）：\n${conclusion}\n\n结果限制：\n${(run.result.warnings || []).join('\n')}\n\n本流程未调用语言模型生成收益或结论。`;
         const report = await api('/reports', 'POST', { run_id: run.id, title: draft.name + ' · 复现报告', body }); persist({ ...draft, reportId: report.id }); notify('报告已保存，可进入研究报告继续编辑。');
       }
     } catch (e) { setError(errorMessage(e)); } finally { setBusy(''); }
   }
   const steps = [{ label: '来源登记', done: draft.sourceRegistered }, { label: '人工定义确认', done: draft.confirmed }, { label: 'AST校验 / 保存', done: !!draft.factorId }, { label: '真实数据评测', done: run?.status === 'completed' }, { label: '结果与报告', done: !!draft.reportId }];
   const replicationRuns = (allRuns.data || []).filter(r => r.config?.replication && `${r.name} ${r.config.replication.source_title || ''}`.toLowerCase().includes(taskSearch.toLowerCase()));
-  function openNew() { persist({ ...initialDraft }); setValidation(null); setError(''); setView('new'); go('/replication?new=1'); }
-  function switchView(value: string) { setView(value); go(value === 'new' ? '/replication?new=1' : '/replication'); }
-  return <><PageHead title="AI 因子复现流水线" description="登记文献定义，追踪真实复现任务；当前为人工确认与规则辅助，语言模型未连接。" actions={<><Tag>模型未连接</Tag>{view === 'new' && <button className="button" onClick={() => downloadJSON('factor-replication.json', { ...draft, validation, run, conclusion })}><Download size={15}/> 导出复现记录</button>}<button className="button primary" onClick={openNew}>新建复现流程 <ArrowRight size={15}/></button></>}/>
+  function openNew() { persist({ ...initialDraft }); setValidation(null); setError(''); setView('new'); go('/replication?manual=1&new=1'); }
+  function switchView(value: string) { setView(value); go(value === 'new' ? '/replication?manual=1&new=1' : '/replication?manual=1'); }
+  return <><PageHead title="人工模板复现与历史" description="保留原人工定义、流程草稿和真实研究任务；此流程不调用 AI API。" actions={<><Tag>人工模板流程</Tag>{view === 'new' && <button className="button" onClick={() => downloadJSON('factor-replication.json', { ...draft, validation, run, conclusion })}><Download size={15}/> 导出复现记录</button>}<button className="button primary" onClick={openNew}>新建复现流程 <ArrowRight size={15}/></button></>}/>
     <Panel><Tabs items={[{ id: 'tasks', label: '复现任务' }, { id: 'new', label: '新建 / 继续流程' }]} value={view} onChange={switchView}/></Panel>
     {view === 'tasks' ? <Panel title="文献复现任务" description="只显示实际登记了文献来源的研究任务。" actions={draft.runId ? <button className="text-button" onClick={() => switchView('new')}>继续当前流程 <ArrowRight size={14}/></button> : undefined}>
       <div className="filter-bar"><SearchInput value={taskSearch} onChange={setTaskSearch} placeholder="搜索任务或文献来源"/><Tag>{replicationRuns.length} 项实际任务</Tag><button className="button" onClick={allRuns.refresh}><RefreshCw size={14}/> 刷新</button></div>
