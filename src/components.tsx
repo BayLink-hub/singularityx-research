@@ -101,6 +101,16 @@ export function DataTable({ rows, empty = '暂无记录' }: {
 }) { const [page, setPage] = useState(1); if (!rows?.length)
     return <Empty title={empty}/>; const keys = Array.from(new Set(rows.slice(0, 20).flatMap(Object.keys))); const safePage = Math.min(page, Math.ceil(rows.length / 15)); return <><div className="table-scroll"><table><thead><tr>{keys.map(key => <th key={key} title={key}>{metricNames[key] || key}</th>)}</tr></thead><tbody>{rows.slice((safePage - 1) * 15, safePage * 15).map((row, i) => <tr key={i}>{keys.map(key => <td key={key} title={fmt(row[key], key)}>{fmt(row[key], key)}</td>)}</tr>)}</tbody></table></div><Pagination page={safePage} total={rows.length} onChange={setPage} size={15}/></>; }
 const colors = ['#7364d9', '#3da19b', '#e4b960', '#dd7f91', '#6098d5', '#a2b575', '#be8bd7', '#f2a579', '#76948a', '#8c8cdb'];
+/** Read only the result's recorded benchmark metadata; never infer one from the current environment. */
+export function benchmarkDescriptor(result: RecordData, config: RecordData = {}) {
+    const candidate = result.benchmark || result.provenance?.benchmark || result.benchmark_source;
+    const metadata = candidate && typeof candidate === 'object' ? candidate : {};
+    const recordedName = typeof candidate === 'string' ? candidate : metadata.name || result.provenance?.source?.benchmark;
+    const id = metadata.id || config.benchmark_id || (metadata.code ? 'index:' + metadata.code : '');
+    const name = typeof recordedName === 'string' && recordedName ? recordedName : id ? '基准 ' + id : '历史任务未记录基准名称';
+    const basis = metadata.basis || metadata.provenance?.basis || metadata.return_basis || metadata.return_definition || result.provenance?.benchmark_alignment || (typeof recordedName === 'string' && recordedName.includes('价格指数') ? '价格指数收盘收益，不含分红；首个研究日收盘归一为 1。' : '此历史任务未冻结完整基准口径，请查看数据来源或独立计算对比基准。');
+    return { id, name, basis: String(basis), provenance: metadata.provenance || metadata };
+}
 export function TimeChart({ data, keys, labels = {}, percent = false, height = 310 }: {
     data: RecordData[];
     keys: string[];

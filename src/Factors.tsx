@@ -11,7 +11,7 @@ export function FactorLibrary({ publicMode = false }: { publicMode?: boolean }) 
     const [recycle, setRecycle] = useState(false), [mutationError, setMutationError] = useState('');
     const factors = (query.data || []).filter(f => !!f.deleted === recycle), categories = Array.from(new Set(factors.map(f => f.category || '未分类')));
     const evaluated = factors.map(factor => {
-        const latest = [...(runsQuery.data || [])].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).find(run => run.status === 'completed' && run.kind === 'factor' && run.config?.factor_versions?.length === 1 && run.config.factor_versions[0].id === factor.id && run.config.factor_versions[0].version === factor.version && run.config.factor_versions[0].code_hash === factor.code_hash);
+        const latest = [...(runsQuery.data || [])].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).find(run => run.status === 'completed' && run.validation_status !== 'invalidated' && run.kind === 'factor' && run.config?.factor_versions?.length === 1 && run.config.factor_versions[0].id === factor.id && run.config.factor_versions[0].version === factor.version && run.config.factor_versions[0].code_hash === factor.code_hash);
         return { factor, run: latest, ic: (latest ? latest.metrics?.ic_mean : factor.version === 1 ? factor.legacy_metrics?.ic_mean : null) ?? null, ir: (latest ? latest.metrics?.icir ?? latest.metrics?.icir_annualized : factor.version === 1 ? factor.legacy_metrics?.icir : null) ?? null };
     });
     const bounded = (value: number | null, low: string, high: string, scale = 1) => !low && !high || value !== null && (!low || value >= Number(low) / scale) && (!high || value <= Number(high) / scale);

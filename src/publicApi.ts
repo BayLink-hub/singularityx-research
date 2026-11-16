@@ -239,11 +239,70 @@ function factorSummary(factor: Row, state: State) {
   const { versions: _versions, ...value } = factor;
   return { ...value, metrics: latest?.metrics || (factor.version === 1 ? factor.legacy_metrics : null) || null, latest_metrics: latest?.metrics || null, latest_run_id: latest?.id || null, latest_run_source: latest?.source_kind || null, status: factor.deleted ? 'deleted' : latest ? 'evaluated' : factor.status || 'ready' };
 }
-function entries(config: Row, state: State): Row[] {
+const PUBLIC_UNIVERSE_ID = 'public_sample';
+const PUBLIC_BENCHMARK_ID = 'index:000300.SH';
+const SIGNAL_WEIGHT_DEFINITION = '信号权重无量纲，不是资金或持仓比例；0权重不参与。1个非零因子保留原值并按符号定向；多个非零因子各自在当日有效截面做百分位排名，再按w/Σ|w|相加，合成只保留共同有效样本。';
+function selectionConfig(given: unknown): Row {
+  if (!given || typeof given !== 'object' || Array.isArray(given)) return fail('研究配置须为对象');
+  const config = { ...(given as Row), universe_id: (given as Row).universe_id ?? PUBLIC_UNIVERSE_ID, benchmark_id: (given as Row).benchmark_id ?? PUBLIC_BENCHMARK_ID };
+  if (config.universe_id !== PUBLIC_UNIVERSE_ID) return fail('公开引擎仅支持 public_sample 固定股票样本；其它股票池请连接本地引擎。');
+  if (config.benchmark_id !== PUBLIC_BENCHMARK_ID) return fail('公开引擎仅接入 index:000300.SH 沪深300价格指数；不使用其他数据冒充所选基准。');
+  return config;
+}
+function benchmarkMetadata(data: PublicMarket, marketHash?: string): Row {
+  return { id: PUBLIC_BENCHMARK_ID, name: data.source.benchmark || '沪深300价格指数 000300.SH', basis: '价格指数收盘收益，不含分红；按策略净值日期对齐，首个研究日收盘归一为 1。',
+    provenance: { code: '000300.SH', field: 'close', provider: data.source.provider, url: data.source.url, market_sha256: marketHash, source_benchmark: data.source.benchmark, normalization: 'benchmark_close[t] / benchmark_close[first_strategy_date]', return_basis: '价格指数，不含分红，不是ETF或全收益指数' } };
+}
+function publicResearchOptions(data: PublicMarket): Row {
+  const parsed = marketFrames(data), available_fields = Object.entries(parsed.frames).filter(([, rows]) => rows.some(row => row.some(Number.isFinite))).map(([field]) => field);
+  const start = parsed.dates[0], end = parsed.dates.at(-1), benchmark = benchmarkMetadata(data);
+  const benchmarkDates = data.benchmark.map(row => row.date).sort();
+  return { data_mode: 'public', available_fields, start_date: start, end_date: end, default_universe_id: PUBLIC_UNIVERSE_ID, default_benchmark_id: PUBLIC_BENCHMARK_ID,
+    universes: [{ id: PUBLIC_UNIVERSE_ID, name: `公开固定 ${parsed.symbols.length} 股样本`, description: '固定存续证券，存在事后选样和幸存者偏差，不代表全A股或官方指数成份。', basis: '实际公开未复权行情；仅按已提供证券和日期研究。', available: true, start_date: start, end_date: end, stock_count: parsed.symbols.length, dates_count: parsed.dates.length }],
+    benchmarks: [{ ...benchmark, available: benchmarkDates.length > 0, start_date: benchmarkDates[0] || null, end_date: benchmarkDates.at(-1) || null, dates_count: benchmarkDates.length }],
+    limits: { max_factors: 8 }, note: '只列出当前真实接入的数据。更多股票池、指数与原work股票级因子值需连接本地引擎。' };
+}
+function selectedDefinitions(config: Row, state: State): Row[] {
   const selected = config.factors || [{ factor_id: config.factor_id, weight: 1 }];
-  if (!Array.isArray(selected) || selected.length < 1 || selected.length > 8 || new Set(selected.map(x => x.factor_id)).size !== selected.length) return fail('请选择1–8个不重复的原生因子');
-  const result = selected.map(entry => { const f = lookup(state.factors, entry.factor_id), weight = entry.weight ?? 1; if (f.deleted) return fail('此因子已删除，请先恢复'); if (f.source_kind !== 'native_ast') return fail('原 Python 源码尚未迁移为当前可执行 AST；可以查看原版历史研究或建立 AST 版本。'); if (typeof weight !== 'number' || !Number.isFinite(weight) || Math.abs(weight) > 100) return fail('因子权重须为 −100 至 100 的有限数'); const parsed = validateCode(f.code); if (!parsed.valid || JSON.stringify(parsed.ast) !== JSON.stringify(f.ast)) return fail('持久化因子代码与 AST 不一致'); const { versions: _, ...snapshot } = f; return { ...snapshot, weight }; });
-  if (result.every(f => f.weight === 0)) return fail('因子权重不能全部为零'); return result;
+  if (!Array.isArray(selected) || selected.length < 1 || selected.length > 8 || selected.some(entry => !entry || typeof entry !== 'object' || typeof entry.factor_id !== 'string') || new Set(selected.map(entry => entry.factor_id)).size !== selected.length) return fail('请选择1–8个不重复的因子定义');
+  const result = selected.map(entry => { const factor = lookup(state.factors, entry.factor_id), weight = entry.weight ?? 1; if (factor.deleted) return fail('此因子已删除，请先恢复'); if (typeof weight !== 'number' || !Number.isFinite(weight) || Math.abs(weight) > 100) return fail('信号权重须为 −100 至 100 的有限数（无量纲）'); const { versions: _, ...snapshot } = factor; return { ...snapshot, weight }; });
+  if (result.every(factor => factor.weight === 0)) return fail('因子权重不能全部为零');
+  return result;
+}
+function checkPublicResearch(config: Row, state: State, data: PublicMarket): Row {
+  const options = publicResearchOptions(data), errors: string[] = [], factors: Row[] = [];
+  for (const factor of selectedDefinitions(config, state)) {
+    let reason = ''; let missing_fields: string[] = [];
+    if (factor.weight === 0) { factors.push({ id: factor.id, ready: true, missing_fields, reason: '0权重，不参与计算' }); continue; }
+    if (factor.source_kind !== 'native_ast') reason = '公开版没有股票级work原值快照；请连接有原Parquet的本地引擎。历史净值不能拼成新的组合。';
+    else {
+      const parsed = validateCode(factor.code);
+      if (!parsed.valid) reason = parsed.errors.join('；');
+      else if (JSON.stringify(parsed.ast) !== JSON.stringify(factor.ast)) reason = '持久化因子代码与AST不一致，请重新校验并保存。';
+      else { missing_fields = parsed.dependencies.filter((field: string) => !options.available_fields.includes(field)); if (missing_fields.length) reason = '当前真实行情缺少已验证字段：' + missing_fields.join('、') + '。请选择其他因子或连接具备字段的本地引擎。'; }
+    }
+    factors.push({ id: factor.id, ready: !reason, missing_fields, reason });
+    if (reason) errors.push(factor.name + '：' + reason);
+  }
+  return { ready: !errors.length, errors, factors, data_mode: 'public', note: '字段预检后，计算仍检查真实预热与共同有效样本；无效因子不会悄悄跳过。' };
+}
+function entries(config: Row, state: State, data: PublicMarket): Row[] {
+  const check = checkPublicResearch(config, state, data);
+  if (!check.ready) return fail(check.errors.join('\n'));
+  return selectedDefinitions(config, state).filter(factor => factor.weight !== 0);
+}
+async function comparePublicBenchmark(run: Row, state: State, identifier: string | null): Promise<Row> {
+  if (run.status !== 'completed' || !run.result?.curves?.length) return fail('任务尚未产生完整净值，不能计算对比基准');
+  if (identifier !== PUBLIC_BENCHMARK_ID) return fail('公开引擎只提供 index:000300.SH 沪深300价格指数对比');
+  let data = state.datasets[run.market_sha256];
+  if (!data) { const current = await publicMarket(); if (current.sha256 !== run.market_sha256) return fail('该任务的冻结行情快照不可用；不会使用新行情覆盖历史对比', 409); data = current.data; }
+  marketFrames(data);
+  const dates: string[] = run.result.curves.map((row: Row) => row.date), prices = new Map(data.benchmark.map(row => [row.date, row.close]));
+  const missing = dates.filter(date => !Number.isFinite(prices.get(date)) || prices.get(date)! <= 0);
+  if (missing.length) return fail(`冻结行情缺少 ${missing.length} 个净值日期的真实基准报价（如 ${missing[0]}）；未填充或改用别的价格。`);
+  const anchor = prices.get(dates[0])!, curves = dates.map(date => ({ date, benchmark: prices.get(date)! / anchor })), last = curves.at(-1)!.benchmark;
+  const strategyNav = run.result.curves.at(-1)?.nav;
+  return { benchmark: benchmarkMetadata(data, run.market_sha256), curves, metrics: { benchmark_return: last - 1, excess_return: Number.isFinite(strategyNav) ? strategyNav - last : null }, comparison_only: true, run_id: run.id };
 }
 async function calculate(runId: string) {
   const control = { cancelled: false }; running.set(runId, control);
@@ -256,6 +315,9 @@ async function calculate(runId: string) {
     const result = await runBrowserResearch(data, run.config, run.factor_specs, (progress, message) => { pending = pending.then(() => mutate(s => { const r = lookup(s.runs, runId); if (r.status !== 'cancelled') Object.assign(r, { progress, message, updated_at: now() }); return r; })).catch(e => { persistenceError = e; control.cancelled = true; }); }, () => control.cancelled || read().runs.find(r => r.id === runId)?.status === 'cancelled');
     await pending;
     if (persistenceError) throw persistenceError;
+    result.benchmark = benchmarkMetadata(data, run.market_sha256);
+    result.provenance.benchmark = result.benchmark;
+    result.provenance.signal_weight_definition = SIGNAL_WEIGHT_DEFINITION;
     result.provenance.market_sha256 = run.market_sha256;
     result.provenance.storage = storageMode + '，仅保存在当前浏览器，不自动同步其他设备';
     await mutate(s => { const r = lookup(s.runs, runId); if (r.status !== 'cancelled') Object.assign(r, { status: 'completed', progress: 100, message: '公开行情真实计算完成 · 本机保存', result, metrics: result.metrics, finished_at: now(), updated_at: now() }); return r; });
@@ -270,6 +332,12 @@ export async function publicRequest(path: string, method = 'GET', body: any = un
   const parts = path.split('?')[0].split('/').filter(Boolean), [collection, identifier, action] = parts;
   if (collection === 'session') return { mode: 'public', authenticated: true, username: '本机研究员', role: 'researcher', ...storageInfo(), note: '公开研究版 · 本机保存；无账号服务器或跨设备同步；发布目录与本机研究记录分开保存' };
   if (collection === 'login' || collection === 'logout') return fail('公开研究版没有账号服务器；本机记录通过浏览器存储保存');
+  if (collection === 'research' && identifier === 'options' && method === 'GET') return publicResearchOptions((await publicMarket()).data);
+  if (collection === 'research' && identifier === 'preflight' && method === 'POST') {
+    const { data } = await publicMarket();
+    try { const config = normalizePublicConfig({ ...selectionConfig(body?.config), kind: body?.kind }, data); return checkPublicResearch(config, read(), data); }
+    catch (error) { return { ready: false, errors: [error instanceof Error ? error.message : String(error)], factors: [], data_mode: 'public' }; }
+  }
   if (collection === 'operators') return publicOperators();
   if (collection === 'data' && identifier === 'benchmark-0933') return asset('work-benchmark-0933.json');
   if (collection === 'data' && identifier === 'catalog') return asset('data-catalog.json');
@@ -331,7 +399,7 @@ export async function publicRequest(path: string, method = 'GET', body: any = un
   }
   if (collection === 'strategies') {
     if (method === 'GET') return read().strategies;
-    if (method === 'POST' || method === 'PUT') { const { data } = await publicMarket(); const config = normalizePublicConfig({ ...body?.config, kind: 'strategy' }, data); return mutate(state => { entries(config, state); return record(state.strategies, { name: text(body?.name, '名称', 160), description: text(body?.description || '', '说明', 5000, false), config }, 'strategy', method === 'PUT' ? identifier : undefined, body.base_version); }); }
+    if (method === 'POST' || method === 'PUT') { const config = { ...selectionConfig(body?.config), kind: 'strategy' }; return mutate(state => { selectedDefinitions(config, state); return record(state.strategies, { name: text(body?.name, '名称', 160), description: text(body?.description || '', '说明', 5000, false), config }, 'strategy', method === 'PUT' ? identifier : undefined, body.base_version); }); }
   }
   if (collection === 'runs') {
     if (method === 'GET') {
@@ -344,13 +412,14 @@ export async function publicRequest(path: string, method = 'GET', body: any = un
         run = { ...bundle.run, market_sha256: bundle.data_sha256 };
       }
       if (!run) return fail('研究任务不存在', 404);
+      if (action === 'benchmark') return comparePublicBenchmark(run, state, new URLSearchParams(path.split('?')[1] || '').get('benchmark_id'));
       if (action === 'export') { if (run.status !== 'completed') return fail('任务尚未完成', 409); return { schema: 'quant.public.run', version: 1, exported_at: now(), run, data: state.datasets[run.market_sha256] || (await publicMarket()).data }; } return run;
     }
     if (action === 'cancel' && method === 'POST') { const control = running.get(identifier); if (control) control.cancelled = true; return mutate(state => { const run = lookup(state.runs, identifier); if (!['queued', 'running'].includes(run.status)) return fail('任务已经结束', 409); Object.assign(run, { status: 'cancelled', message: '用户取消', finished_at: now() }); return run; }); }
     if (method === 'POST' && !identifier) {
-      const { data, sha256 } = await publicMarket(), config = normalizePublicConfig({ ...body?.config, kind: body?.kind }, data), name = text(body?.name, '任务名称', 160), specs = entries(config, read());
+      const { data, sha256 } = await publicMarket(), config = normalizePublicConfig({ ...selectionConfig(body?.config), kind: body?.kind }, data), name = text(body?.name, '任务名称', 160), specs = entries(config, read(), data);
       const factor_versions = await Promise.all(specs.map(async f => ({ id: f.id, version: f.version, weight: f.weight, code_hash: await hashText(f.code) })));
-      const run = await mutate(state => { if (state.runs.filter(r => ['queued', 'running'].includes(r.status)).length >= 3) return fail('最多同时排队3个浏览器任务，请等待或取消', 429); const latest = entries(config, state); if (latest.some((f, i) => f.version !== specs[i].version)) return fail('因子刚被修改，请重新提交', 409); state.datasets[sha256] = data; const stamp = now(); const value: Row = { id: id('run'), name, kind: config.kind, status: 'queued', progress: 0, message: '已冻结参数，等待浏览器计算', created_at: stamp, updated_at: stamp, finished_at: null, source_kind: 'browser_public_run', owner_tab: tabId, market_sha256: sha256, config: { ...config, factor_versions, language_version: LANGUAGE_VERSION, engine_version: ENGINE_VERSION, sample_status: '固定公开小样本探索；非独立样本外验证' }, factor_specs: clone(specs), metrics: null, result: null }; state.runs.push(value); return value; });
+      const run = await mutate(state => { if (state.runs.filter(r => ['queued', 'running'].includes(r.status)).length >= 3) return fail('最多同时排队3个浏览器任务，请等待或取消', 429); const latest = entries(config, state, data); if (latest.some((f, i) => f.version !== specs[i].version)) return fail('因子刚被修改，请重新提交', 409); state.datasets[sha256] = data; const stamp = now(); const value: Row = { id: id('run'), name, kind: config.kind, status: 'queued', progress: 0, message: '已冻结参数，等待浏览器计算', created_at: stamp, updated_at: stamp, finished_at: null, source_kind: 'browser_public_run', owner_tab: tabId, market_sha256: sha256, config: { ...config, factor_versions, signal_weight_definition: SIGNAL_WEIGHT_DEFINITION, language_version: LANGUAGE_VERSION, engine_version: ENGINE_VERSION, sample_status: '固定公开小样本探索；非独立样本外验证' }, factor_specs: clone(specs), metrics: null, result: null }; state.runs.push(value); return value; });
       setTimeout(() => { void calculate(run.id); }, 0); return run;
     }
   }
