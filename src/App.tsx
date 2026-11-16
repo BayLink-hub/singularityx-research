@@ -3,6 +3,7 @@ import { Activity, ArrowRight, BarChart3, BookOpen, Calculator, Check, ChevronLe
 import { api, downloadFile, errorMessage, go, type RecordData, type Run, useApi, useRoute } from './api';
 import { DataTable, Empty, ErrorBox, Field, JsonView, Loading, PageHead, Pagination, Panel, SearchInput, Status, Tag, dateTime, fmt } from './components';
 import { FactorDetail, FactorLibrary } from './Factors';
+import { DataQuality } from './DataCenter';
 import { ResearchForm, RunDetail, Runs } from './Research';
 import { OperatorLibrary, IpoCalculator, EventResearch, ReplicationPipeline, SystemStatus } from './ResearchModules';
 const navItems = [
@@ -14,7 +15,7 @@ const navItems = [
     { path: '/operators', label: '人工算子', icon: SlidersHorizontal },
     { path: '/strategies', label: '多因子量化策略', icon: BarChart3 },
     { path: '/runs', label: '研究任务', icon: Activity },
-    { path: '/data', label: '数据与质量', icon: Database },
+    { path: '/data', label: '数据中心与字段', icon: Database },
     { path: '/system', label: '系统状态', icon: Settings },
 ];
 function BrandLogo() {
@@ -40,7 +41,7 @@ export default function App() {
         <aside className="sidebar"><a href="#/factors" className="brand"><BrandLogo/><div><strong>SINGULARITYX</strong><small>零界演化</small></div></a>
             <nav aria-label="主导航">{navItems.map(item => <a key={item.path} title={item.label} href={'#' + item.path} className={current.path === item.path ? 'active' : ''}><item.icon size={21}/><span>{item.label}</span></a>)}</nav>
             <button className="sidebar-collapse" aria-label={collapsed ? '展开侧栏' : '收起侧栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <ChevronRight size={19}/> : <ChevronLeft size={19}/>}</button>
-            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.2.0</small></div>
+            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.3.0</small></div>
         </aside>{sidebar && <button className="sidebar-shade" aria-label="关闭导航" onClick={() => setSidebar(false)}/>}
         <div className="main-shell"><header className="topbar"><div className="breadcrumb"><button className="icon-button menu-button" aria-label="展开导航" onClick={() => setSidebar(!sidebar)}><Menu size={20}/></button><a href="#/factors">首页</a><span>/</span><strong>{current.label}</strong></div><div className="topbar-right"><Tag tone="amber">{modeLabel}</Tag><Tag tone="green"><current.icon size={13}/>{current.label}</Tag>{!isPublic && session.data?.mode !== 'development' && <button title="退出登录" className="icon-button" onClick={async () => { try { await api('/logout', 'POST'); session.refresh(); } catch (e) { notify(errorMessage(e)); } }}><LogOut size={16}/></button>}</div></header>
             <main key={path} className="workspace">
@@ -110,14 +111,3 @@ function AuditValue({ value, depth = 0 }: {
     return <div className="audit-items">{value.map((v, i) => <div key={i} className="audit-item"><AuditValue value={v} depth={depth + 1}/></div>)}</div>;
 } if (typeof value === 'object')
     return <div className={'audit-fields depth-' + Math.min(depth, 2)}>{Object.entries(value).map(([key, v]) => <div className={'audit-field ' + (v && typeof v === 'object' ? 'wide' : '')} key={key}><span title={key}>{auditNames[key] || key}</span><div><AuditValue value={v} depth={depth + 1}/></div></div>)}</div>; return <span className={typeof value === 'string' && value.startsWith('/') ? 'mono audit-path' : ''}>{fmt(value)}</span>; }
-function DataQuality({publicMode = false}: {publicMode?: boolean}) {
-    const query = useApi('/data');
-    const data = query.data;
-    return <><PageHead eyebrow="DATA FOUNDATION" title="数据与质量" description="了解研究数据来自哪里、覆盖什么，以及哪些问题仍需要验证。" actions={<button className="button" onClick={query.refresh}><RefreshCw size={15}/> 刷新审计</button>}/>{query.error && <ErrorBox message={query.error} retry={query.refresh}/>}<div className="notice purple"><ShieldCheck size={19}/><span>{publicMode ? '公开研究版使用固定证券小样本，结果仅保存在当前浏览器。原始价格未复权，不代表全 A 股或完整公司行动回测。' : '原始数据保持只读。目录覆盖已清点；内容质量来自样本与本次运行分区校验。'}</span></div>{query.loading ? <Loading /> : data ? <>
-    <div className="data-summary"><div><span>股票日线覆盖</span><strong>{data.start_date || '待核验'} <i>—</i> {data.end_date || '待核验'}</strong><small>历史数据快照</small></div><div><span>{publicMode ? '样本交易日' : '已发现日线分区'}</span><strong>{fmt(data.dates_count)} <i>个交易日</i></strong><small>{publicMode ? '按已加载历史行情统计' : '按实际目录清点'}</small></div><div><span>本次审计时间</span><strong>{dateTime(data.checked_at)}</strong><small>{publicMode ? '浏览器已载入数据检查' : '样本检查与目录可用性'}</small></div></div>
-    <Panel title={publicMode ? '公开样本与数据来源' : '数据目录'} description="各类数据的可用性与覆盖范围"><div className="table-scroll"><table><thead><tr><th>数据集</th><th>覆盖范围</th><th>可用性</th><th>记录数量 / 统计范围</th></tr></thead><tbody>{(data.datasets || []).map((d: RecordData, i: number) => <tr key={i}><td><strong className="dataset-name">{d.name}</strong><small className="cell-sub mono" title={d.path}>{d.path}</small></td><td>{d.start || '—'} — {d.end || '—'}</td><td><Tag tone={d.status === 'available' ? 'green' : 'red'}>{d.status === 'available' ? (publicMode ? '可用' : '目录可用') : d.status === 'missing' ? (publicMode ? '缺失' : '目录缺失') : d.status}</Tag></td><td>{fmt(d.rows)}<small className="cell-sub" style={{ maxWidth: 310 }}>{d.rows_scope || '未进行全量内容统计'}</small></td></tr>)}</tbody></table></div></Panel>
-    <div className="audit-section"><h2>数据限制与处理原则</h2><p>这些边界会影响研究结论，应与结果一起阅读。</p><div className="issue-grid">{(data.issues || []).map((issue: RecordData, i: number) => <article className="issue-card" key={i}><div><ShieldCheck size={16}/><Tag tone={issue.severity === 'warning' ? 'amber' : 'purple'}>{issue.severity === 'warning' ? '需要关注' : '处理说明'}</Tag></div><h3>{issue.title}</h3><p>{issue.detail}</p></article>)}</div></div>
-    <Panel title="内容抽样检查" description="下表仅代表列出的日期与样本，不等同于全量数据通过检查。"><DataTable rows={(data.sampled_checks || []).map((row: RecordData) => ({ '样本日期': row.date, '样本行数': row.rows, '唯一证券数': row.unique_codes, '重复主键数': row.duplicate_keys, '缺失 OHLCV 单元格': row.missing_ohlcv }))}/></Panel>
-    <Panel title="字段单位" className="unit-panel"><div className="padded"><AuditValue value={data.unit_policy || {}}/></div></Panel><details className="raw-detail"><summary>查看完整审计记录与路径</summary><JsonView value={data}/></details>
-  </> : <Empty title="审计结果尚未生成"/>}</>;
-}

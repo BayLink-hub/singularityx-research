@@ -1,11 +1,14 @@
-/** Same application contract, public data only, with explicit browser-local persistence. */
-import { ENGINE_VERSION, FIELDS, jsonSafe, marketFrames, normalizePublicConfig, publicOperators, publicSeeds, publicWarnings, runBrowserResearch, validateCode, type PublicMarket, type Row } from './browserEngine';
+/** Same application contract, versioned evidence and explicit browser-local persistence. */
+import { ENGINE_VERSION, LANGUAGE_VERSION, evaluateScalar, FIELDS, jsonSafe, marketFrames, normalizePublicConfig, publicOperators, publicSeeds, publicWarnings, runBrowserResearch, validateCode, type PublicMarket, type Row } from './browserEngine';
+
+import { OPERATOR_CATALOG } from './operatorCatalog';
+import { validatePythonSource } from './sourceEditor';
 
 const STORAGE_KEY = 'singularityx.public.research.v1';
 const DATABASE_NAME = 'singularityx-public-research';
 const OBJECT_STORE = 'state';
 const TAB_KEY = 'singularityx.public.tab.v1';
-type State = { schema: number; created_at: string; factors: Row[]; strategies: Row[]; runs: Row[]; reports: Row[]; datasets: Record<string, PublicMarket>; notices: string[] };
+type State = { schema: number; created_at: string; factors: Row[]; strategies: Row[]; runs: Row[]; reports: Row[]; datasets: Record<string, PublicMarket>; notices: string[]; operator_definitions?: Row[]; catalog_revision?: string };
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID().replaceAll('-', '').slice(0, 20)}`;
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -104,6 +107,54 @@ export function publicMarket(): Promise<{ data: PublicMarket; sha256: string }> 
   })().catch(e => { dataPromise = undefined; throw e; });
   return dataPromise;
 }
+
+let publishedRuns: Row[] = [];
+const assetCache = new Map<string, Promise<any>>();
+async function asset(name: string) {
+  if (!assetCache.has(name)) assetCache.set(name, (async () => {
+    const response = await fetch(base() + 'research/' + name, { cache: 'no-cache' });
+    if (!response.ok) throw new PublicApiError(`研究资源 ${name} 读取失败（${response.status}）`, 503);
+    const raw = await response.text(); const value = JSON.parse(raw); Object.defineProperty(value, '__file_sha256', { value: await hashText(raw), enumerable: false }); return value;
+  })().catch(error => { assetCache.delete(name); throw error; }));
+  return assetCache.get(name)!;
+}
+async function syncCatalogs() {
+  const [work, alpha, index, refreshedBundle, market] = await Promise.all([asset('work-catalog.json'), asset('alpha101.json'), asset('alpha101-runs.json'), asset('public-runs.json'), publicMarket()]);
+  if (index.data_sha256 !== market.sha256 || refreshedBundle.data_sha256 !== market.sha256) return fail('预计算数据指纹与当前公开行情不匹配', 503);
+  publishedRuns = index.runs || [];
+  if (!Array.isArray(work.factors) || work.factors.length !== 120 || !Array.isArray(alpha.factors) || alpha.factors.length !== 101) return fail('因子目录数量/格式校验失败，原记录未修改', 503);
+  const revision = await hashText(JSON.stringify([work, alpha, index, refreshedBundle.engine_bundle_sha256 || refreshedBundle.engine_sha256, OPERATOR_CATALOG]));
+  await storageLock(async () => {
+    const state = await loadStored(); if (!state) return;
+    if (state.catalog_revision === revision && state.operator_definitions) { cachedState = clone(state); return; }
+    for (const original of [...work.factors, ...alpha.factors]) {
+      // Deleted records remain as tombstones; shipped updates never overwrite a user's revision.
+      const existing = state.factors.find(f => f.id === original.id);
+      if (existing) {
+        const metadata = Object.fromEntries(['has_history','history_url','history_sha256','legacy_metrics','derived_legacy_metrics','output_metadata','source_bundle','dependency_audit','migration','native_code','published_run_id','published_run_url','published_run_code_hash','published_run_status','published_run_file_sha256'].filter(key => key in original).map(key => [key, original[key]]));
+        Object.assign(existing, metadata, { original_code_hash: original.code_hash });
+        if (existing.version === 1 && existing.code_hash === original.code_hash) Object.assign(existing, { category: original.category, capability: original.capability, implementation_notes: original.implementation_notes, definition_origin: original.definition_origin });
+        continue;
+      }
+      const f = { ...original, original_code_hash: original.code_hash, catalog_origin: original.source_kind === 'legacy' ? 'work120' : 'alpha101', version: original.version || 1, created_at: original.created_at || now(), updated_at: now() };
+      state.factors.push({ ...f, versions: [{ ...f }] });
+    }
+    state.operator_definitions ||= [];
+    for (const original of OPERATOR_CATALOG) if (!state.operator_definitions.some(o => o.id === original.id)) {
+      const value = { ...original, version: 1, custom: false, deleted: false, created_at: now(), updated_at: now() };
+      state.operator_definitions.push({ ...value, versions: [{ ...value }] });
+    }
+    for (const original of refreshedBundle.runs || []) if (!state.runs.some(r => r.id === original.id)) {
+      if (!Array.isArray(original.factor_specs) || original.factor_specs.some((f: Row) => !validateCode(f.code).valid || JSON.stringify(validateCode(f.code).ast) !== JSON.stringify(f.ast))) return fail('新版预计算 AST 校验失败，未修改原研究记录', 503);
+      state.runs.push({ ...original, source_kind: 'published_public_run', market_sha256: market.sha256, progress: 100 });
+    }
+    for (const report of refreshedBundle.reports || []) if (!state.reports.some(r => r.id === report.id)) state.reports.push({ ...report, source_kind: 'published_public_run', versions: [report] });
+    if ((refreshedBundle.runs || []).length) state.datasets[market.sha256] = market.data;
+    state.catalog_revision = revision;
+    await persist(state); cachedState = clone(state);
+  });
+}
+
 function read(): State {
   if (!cachedState) return fail('本机研究记录尚未初始化', 503);
   const value = clone(cachedState);
@@ -132,7 +183,7 @@ async function initialize() {
       if (legacy) { try { localStorage.removeItem(STORAGE_KEY); } catch { /* Migration is committed; leaving a legacy backup is safe. */ } }
       return true;
     });
-    if (found) return;
+    if (found) { await syncCatalogs(); return; }
     const factors = await Promise.all(publicSeeds().map(async f => { const value = { ...f, code_hash: await hashText(f.code) }; return { ...value, versions: [{ ...value }] }; }));
     const state: State = { schema: 1, created_at: now(), factors, strategies: [], runs: [], reports: [], datasets: {}, notices: [] };
     try {
@@ -159,6 +210,7 @@ async function initialize() {
       await persist(value); cachedState = clone(value);
       if (legacy) { try { localStorage.removeItem(STORAGE_KEY); } catch { /* Keep the backup if its removal is denied. */ } }
     });
+    await syncCatalogs();
   })().catch(e => { initializing = undefined; throw e; });
   return initializing;
 }
@@ -183,14 +235,14 @@ function record(items: Row[], payload: Row, prefix: string, identifier?: string,
   return saved;
 }
 function factorSummary(factor: Row, state: State) {
-  const latest = state.runs.filter(r => r.status === 'completed' && r.kind === 'factor' && r.config?.factor_versions?.length === 1 && r.config.factor_versions[0].id === factor.id && r.config.factor_versions[0].version === factor.version).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+  const latest = [...state.runs, ...publishedRuns].filter(r => r.status === 'completed' && r.kind === 'factor' && r.config?.factor_versions?.length === 1 && r.config.factor_versions[0].id === factor.id && r.config.factor_versions[0].version === factor.version && (!r.config.factor_versions[0].code_hash || r.config.factor_versions[0].code_hash === factor.code_hash)).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
   const { versions: _versions, ...value } = factor;
-  return { ...value, metrics: latest?.metrics || null, latest_metrics: latest?.metrics || null, latest_run_id: latest?.id || null, latest_run_source: latest?.source_kind || null, status: latest ? 'evaluated' : 'ready' };
+  return { ...value, metrics: latest?.metrics || (factor.version === 1 ? factor.legacy_metrics : null) || null, latest_metrics: latest?.metrics || null, latest_run_id: latest?.id || null, latest_run_source: latest?.source_kind || null, status: factor.deleted ? 'deleted' : latest ? 'evaluated' : factor.status || 'ready' };
 }
 function entries(config: Row, state: State): Row[] {
   const selected = config.factors || [{ factor_id: config.factor_id, weight: 1 }];
   if (!Array.isArray(selected) || selected.length < 1 || selected.length > 8 || new Set(selected.map(x => x.factor_id)).size !== selected.length) return fail('请选择1–8个不重复的原生因子');
-  const result = selected.map(entry => { const f = lookup(state.factors, entry.factor_id), weight = entry.weight ?? 1; if (typeof weight !== 'number' || !Number.isFinite(weight) || Math.abs(weight) > 100) return fail('因子权重须为 −100 至 100 的有限数'); const parsed = validateCode(f.code); if (!parsed.valid || JSON.stringify(parsed.ast) !== JSON.stringify(f.ast)) return fail('持久化因子代码与 AST 不一致'); const { versions: _, ...snapshot } = f; return { ...snapshot, weight }; });
+  const result = selected.map(entry => { const f = lookup(state.factors, entry.factor_id), weight = entry.weight ?? 1; if (f.deleted) return fail('此因子已删除，请先恢复'); if (f.source_kind !== 'native_ast') return fail('原 Python 源码尚未迁移为当前可执行 AST；可以查看原版历史研究或建立 AST 版本。'); if (typeof weight !== 'number' || !Number.isFinite(weight) || Math.abs(weight) > 100) return fail('因子权重须为 −100 至 100 的有限数'); const parsed = validateCode(f.code); if (!parsed.valid || JSON.stringify(parsed.ast) !== JSON.stringify(f.ast)) return fail('持久化因子代码与 AST 不一致'); const { versions: _, ...snapshot } = f; return { ...snapshot, weight }; });
   if (result.every(f => f.weight === 0)) return fail('因子权重不能全部为零'); return result;
 }
 async function calculate(runId: string) {
@@ -216,16 +268,65 @@ async function calculate(runId: string) {
 export async function publicRequest(path: string, method = 'GET', body: any = undefined, signal?: AbortSignal): Promise<any> {
   await initialize(); await hydrate(); if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const parts = path.split('?')[0].split('/').filter(Boolean), [collection, identifier, action] = parts;
-  if (collection === 'session') return { mode: 'public', authenticated: true, username: '本机研究员', role: 'researcher', ...storageInfo(), note: '公开研究版 · 本机保存；无账号服务器、跨设备同步或私有研究数据' };
+  if (collection === 'session') return { mode: 'public', authenticated: true, username: '本机研究员', role: 'researcher', ...storageInfo(), note: '公开研究版 · 本机保存；无账号服务器或跨设备同步；发布目录与本机研究记录分开保存' };
   if (collection === 'login' || collection === 'logout') return fail('公开研究版没有账号服务器；本机记录通过浏览器存储保存');
   if (collection === 'operators') return publicOperators();
-  if (collection === 'factors' && identifier === 'validate' && method === 'POST') return validateCode(text(body?.code, '代码', 12000));
-  if (collection === 'factors') {
-    if (method === 'GET') { const state = read(); if (!identifier) return state.factors.map(f => factorSummary(f, state)); if (action === 'history') return fail('公开研究版没有私有历史因子或原始回测归档', 404); const factor = lookup(state.factors, identifier); return { ...factorSummary(factor, state), versions: factor.versions }; }
+  if (collection === 'data' && identifier === 'benchmark-0933') return asset('work-benchmark-0933.json');
+  if (collection === 'data' && identifier === 'catalog') return asset('data-catalog.json');
+  if (collection === 'data' && identifier === 'preview') return fail('源数据保存在本地 data 目录；请在本地后台查看，GitHub 页面未上传此表。');
+  if (collection === 'operator-definitions') {
+    if (method === 'GET') return read().operator_definitions || [];
+    if (method === 'DELETE' || method === 'PUT' && body?.deleted === false && !body?.name) return mutate(state => {
+      const items = state.operator_definitions || [], old = lookup(items, identifier), { versions: _, ...value } = old;
+      return record(items, { ...value, deleted: method === 'DELETE' }, 'operator', identifier, body?.base_version);
+    });
     if (method === 'POST' || method === 'PUT') {
-      const name = text(body?.name, '名称', 160), category = text(body?.category || '自定义', '分类', 80), description = text(body?.description || '', '说明', 5000, false), parsed = validateCode(text(body?.code, '代码', 12000));
-      if (!parsed.valid) return fail(parsed.errors.join('；')); const code_hash = await hashText(parsed.code);
-      return mutate(state => record(state.factors, { name, category, description, ...parsed, code_hash, source_kind: 'native_ast', source_path: '公开浏览器 AST 编辑器', status: 'ready', limitations: publicWarnings.slice(0, 2), metrics: null }, 'factor', method === 'PUT' ? identifier : undefined, body.base_version));
+      const payload: Row = {};
+      for (const key of ['name', 'category', 'formula', 'description', 'fields', 'window', 'timing', 'source', 'sourceLabel']) payload[key] = text(body?.[key] ?? '', key, key === 'description' ? 8000 : 2000, ['name', 'category', 'formula'].includes(key));
+      if (payload.source && !/^https?:\/\//i.test(payload.source)) return fail('来源地址须为 HTTP(S) 链接或留空');
+      if (body?.code) { const check = validateCode(text(body.code, '算子模板', 12000)); if (!check.valid) return fail(check.errors.join('；')); payload.code = check.code; }
+      if (body?.manual) {
+        const manual = body.manual;
+        if (!Array.isArray(manual.inputs) || manual.inputs.length < 1 || manual.inputs.length > 20 || !manual.inputs.every((i: Row) => typeof i.key === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(i.key) && typeof i.label === 'string')) return fail('手填输入定义无效');
+        if (new Set(manual.inputs.map((i: Row) => i.key)).size !== manual.inputs.length) return fail('手填输入变量不可重名');
+        text(manual.expression, '手填表达式', 4000); evaluateScalar(manual.expression, Object.fromEntries(manual.inputs.map((i: Row) => [i.key, 1]))); payload.manual = clone(manual);
+      }
+      if (body?.parameters) { if (!Array.isArray(body.parameters) || body.parameters.length > 20) return fail('参数定义无效'); payload.parameters = clone(body.parameters); }
+      if (!payload.code && !payload.manual) return fail('算子需提供可校验代码模板或手填表达式');
+      return mutate(state => { state.operator_definitions ||= []; const old = method === 'PUT' ? lookup(state.operator_definitions, identifier) : undefined; return record(state.operator_definitions, { ...payload, custom: old?.custom ?? true, deleted: body?.deleted === false ? false : old?.deleted || false }, 'operator', method === 'PUT' ? identifier : undefined, body?.base_version); });
+    }
+  }
+  if (collection === 'factors' && identifier === 'validate' && method === 'POST') return body?.language === 'python' ? validatePythonSource(text(body?.code, 'Python代码', 100000)) : validateCode(text(body?.code, '代码', 12000));
+  if (collection === 'factors') {
+    if (method === 'GET') {
+      const state = read(); if (!identifier) return state.factors.map(f => factorSummary(f, state));
+      const factor = lookup(state.factors, identifier);
+      if (action === 'history') {
+        if (!factor.history_url || !/^research\/work-history\/[A-Za-z0-9_]+\.json$/.test(factor.history_url)) return fail('该因子没有原始历史研究', 404);
+        const history = await asset(factor.history_url.slice('research/'.length)); if (factor.history_sha256 && history.__file_sha256 !== factor.history_sha256) return fail('原始历史研究指纹不匹配，请重新载入目录', 503); return history;
+      }
+      if (action === 'sources') { const work = await asset('work-catalog.json'); return Object.fromEntries((factor.source_bundle || []).map((key: string) => [key, work.source_modules[key]])); }
+      return { ...factorSummary(factor, state), versions: factor.versions };
+    }
+    if (method === 'DELETE' || method === 'PUT' && body?.deleted === false && !body?.name) return mutate(state => {
+      const old = lookup(state.factors, identifier), { versions: _, ...value } = old;
+      return record(state.factors, { ...value, deleted: method === 'DELETE' }, 'factor', identifier, body?.base_version);
+    });
+    if (method === 'POST' || method === 'PUT') {
+      const old = method === 'PUT' ? lookup(read().factors, identifier) : undefined;
+      const python = body?.language === 'python' || old?.source_kind === 'legacy' && body?.language !== 'restricted';
+      const name = text(body?.name, '名称', 160), category = text(body?.category || '自定义', '分类', 80), description = text(body?.description || '', '说明', 5000, false);
+      const code = text(body?.code, '代码', python ? 100000 : 12000), parsed = python ? validatePythonSource(code) : validateCode(code);
+      if (!parsed.valid) return fail(parsed.errors.join('；')); const code_hash = await hashText(parsed.code!);
+      return mutate(state => {
+        const previous = method === 'PUT' ? lookup(state.factors, identifier) : undefined, { versions: _, ...kept } = previous || {};
+        const unchangedCode = previous?.code === code;
+        return record(state.factors, { ...kept, name, category, description, ...parsed, ...(python && unchangedCode && previous ? { ast: previous.ast, steps: previous.steps, dependencies: previous.dependencies } : {}), code_hash,
+          source_kind: python ? 'legacy' : 'native_ast', deleted: false, status: python ? 'source_draft' : 'ready',
+          source_path: previous?.source_path || 'web/editor', latest_metrics: null, metrics: null,
+          source_edit_note: python ? 'Python 源码修订只保存和解析，不自动执行。旧历史结果属于原始版本。' : undefined,
+          limitations: previous?.limitations || publicWarnings.slice(0, 2) }, 'factor', method === 'PUT' ? identifier : undefined, body.base_version);
+      });
     }
   }
   if (collection === 'strategies') {
@@ -234,29 +335,38 @@ export async function publicRequest(path: string, method = 'GET', body: any = un
   }
   if (collection === 'runs') {
     if (method === 'GET') {
-      const state = read(); if (!identifier) return state.runs.map(({ result: _, factor_specs: __, ...run }) => run).sort((a, b) => b.created_at.localeCompare(a.created_at));
-      const run = lookup(state.runs, identifier); if (action === 'export') { if (run.status !== 'completed') return fail('任务尚未完成', 409); return { schema: 'quant.public.run', version: 1, exported_at: now(), run, data: state.datasets[run.market_sha256] }; } return run;
+      const state = read(); if (!identifier) return [...state.runs.map(({ result: _, factor_specs: __, ...run }) => run), ...publishedRuns.filter(r => !state.runs.some(s => s.id === r.id))].sort((a, b) => b.created_at.localeCompare(a.created_at));
+      let run = state.runs.find(r => r.id === identifier);
+      if (!run) {
+        const index = publishedRuns.find(r => r.id === identifier); if (!index || !/^research\/alpha101-results\/alpha101_\d{3}\.json$/.test(index.published_run_url)) return fail('研究任务不存在', 404);
+        const bundle = await asset(index.published_run_url.slice('research/'.length));
+        if (bundle.__file_sha256 !== index.file_sha256 || bundle.run?.id !== identifier || bundle.run.factor_specs?.[0]?.code_hash !== index.code_hash) return fail('已发布研究文件指纹或因子定义不匹配', 503);
+        run = { ...bundle.run, market_sha256: bundle.data_sha256 };
+      }
+      if (!run) return fail('研究任务不存在', 404);
+      if (action === 'export') { if (run.status !== 'completed') return fail('任务尚未完成', 409); return { schema: 'quant.public.run', version: 1, exported_at: now(), run, data: state.datasets[run.market_sha256] || (await publicMarket()).data }; } return run;
     }
     if (action === 'cancel' && method === 'POST') { const control = running.get(identifier); if (control) control.cancelled = true; return mutate(state => { const run = lookup(state.runs, identifier); if (!['queued', 'running'].includes(run.status)) return fail('任务已经结束', 409); Object.assign(run, { status: 'cancelled', message: '用户取消', finished_at: now() }); return run; }); }
     if (method === 'POST' && !identifier) {
       const { data, sha256 } = await publicMarket(), config = normalizePublicConfig({ ...body?.config, kind: body?.kind }, data), name = text(body?.name, '任务名称', 160), specs = entries(config, read());
       const factor_versions = await Promise.all(specs.map(async f => ({ id: f.id, version: f.version, weight: f.weight, code_hash: await hashText(f.code) })));
-      const run = await mutate(state => { if (state.runs.filter(r => ['queued', 'running'].includes(r.status)).length >= 3) return fail('最多同时排队3个浏览器任务，请等待或取消', 429); const latest = entries(config, state); if (latest.some((f, i) => f.version !== specs[i].version)) return fail('因子刚被修改，请重新提交', 409); state.datasets[sha256] = data; const stamp = now(); const value: Row = { id: id('run'), name, kind: config.kind, status: 'queued', progress: 0, message: '已冻结参数，等待浏览器计算', created_at: stamp, updated_at: stamp, finished_at: null, source_kind: 'browser_public_run', owner_tab: tabId, market_sha256: sha256, config: { ...config, factor_versions, sample_status: '固定公开小样本探索；非独立样本外验证' }, factor_specs: clone(specs), metrics: null, result: null }; state.runs.push(value); return value; });
+      const run = await mutate(state => { if (state.runs.filter(r => ['queued', 'running'].includes(r.status)).length >= 3) return fail('最多同时排队3个浏览器任务，请等待或取消', 429); const latest = entries(config, state); if (latest.some((f, i) => f.version !== specs[i].version)) return fail('因子刚被修改，请重新提交', 409); state.datasets[sha256] = data; const stamp = now(); const value: Row = { id: id('run'), name, kind: config.kind, status: 'queued', progress: 0, message: '已冻结参数，等待浏览器计算', created_at: stamp, updated_at: stamp, finished_at: null, source_kind: 'browser_public_run', owner_tab: tabId, market_sha256: sha256, config: { ...config, factor_versions, language_version: LANGUAGE_VERSION, engine_version: ENGINE_VERSION, sample_status: '固定公开小样本探索；非独立样本外验证' }, factor_specs: clone(specs), metrics: null, result: null }; state.runs.push(value); return value; });
       setTimeout(() => { void calculate(run.id); }, 0); return run;
     }
   }
   if (collection === 'reports') {
     if (method === 'GET') return read().reports;
-    if (method === 'POST' || method === 'PUT') return mutate(state => { const old = method === 'PUT' ? lookup(state.reports, identifier) : undefined, runId = old?.run_id || body?.run_id; if (lookup(state.runs, runId).status !== 'completed') return fail('报告必须关联一项已完成的真实研究'); return record(state.reports, { title: text(body?.title, '标题', 160), body: text(body?.body || '', '正文', 50000, false), run_id: runId, author: '本机研究员', source_kind: 'browser_public_report' }, 'report', method === 'PUT' ? identifier : undefined, body.base_version); });
+    if (method === 'POST' || method === 'PUT') return mutate(state => { const old = method === 'PUT' ? lookup(state.reports, identifier) : undefined, runId = old?.run_id || body?.run_id; if ((state.runs.find(r => r.id === runId) || publishedRuns.find(r => r.id === runId))?.status !== 'completed') return fail('报告必须关联一项已完成的真实研究'); return record(state.reports, { title: text(body?.title, '标题', 160), body: text(body?.body || '', '正文', 50000, false), run_id: runId, author: '本机研究员', source_kind: 'browser_public_report' }, 'report', method === 'PUT' ? identifier : undefined, body.base_version); });
   }
   if (collection === 'overview' || collection === 'data' || collection === 'system') {
     const { data, sha256 } = await publicMarket(), parsed = marketFrames(data), state = read();
+    const allRuns = [...state.runs, ...publishedRuns.filter(r => !state.runs.some(s => s.id === r.id))];
     const issues = publicWarnings.map((detail, i) => ({ severity: 'warning', title: ['固定公开小样本', '未复权价格收益', '历史状态字段缺失', '成交与容量假设', '成本假设', '统计与交易口径'][i], detail }));
     issues.push({ severity: 'warning', title: '成交额缺失', detail: '公开源 amount 为 null；公式依赖它会拒绝计算，参与率仅使用前日真实成交量。' });
     if (storageFallbackReason) issues.push({ severity: 'warning', title: '本机存储兼容模式', detail: storageFallbackReason });
     state.notices.forEach(detail => issues.push({ severity: 'warning', title: '初始化信息', detail }));
-    if (collection === 'overview') return { factor_count: state.factors.length, native_count: state.factors.length, legacy_count: 0, run_count: state.runs.length, data_start: parsed.dates[0], data_end: parsed.dates.at(-1), latest_runs: state.runs.slice(-5).reverse().map(({ result: _, ...r }) => r), health: { api: 'browser', database: storageMode, mode: 'public' }, issues };
-    if (collection === 'system') return { mode: 'public', engine: ENGINE_VERSION, ...storageInfo(), running: state.runs.filter(r => r.status === 'running').length, queued: state.runs.filter(r => r.status === 'queued').length, record_count: { factors: state.factors.length, runs: state.runs.length, reports: state.reports.length }, storage_bytes: new TextEncoder().encode(JSON.stringify(state)).length, storage_size_basis: '当前完整记录序列化为 UTF-8 的大小，不是数据库物理占用或浏览器配额', data_sha256: sha256, source: data.source, capabilities: { python_server: false, cloud_database: false, broker_trading: false, cross_device_sync: false, browser_calculation: true }, issues };
+    if (collection === 'overview') return { factor_count: state.factors.filter(f => !f.deleted).length, native_count: state.factors.filter(f => !f.deleted && f.source_kind === 'native_ast').length, legacy_count: state.factors.filter(f => !f.deleted && f.source_kind === 'legacy').length, run_count: allRuns.length, data_start: parsed.dates[0], data_end: parsed.dates.at(-1), latest_runs: allRuns.sort((a,b) => b.created_at.localeCompare(a.created_at)).slice(0,5).map(({ result: _, ...r }) => r), health: { api: 'browser', database: storageMode, mode: 'public' }, issues };
+    if (collection === 'system') return { mode: 'public', engine: ENGINE_VERSION, ...storageInfo(), running: state.runs.filter(r => r.status === 'running').length, queued: state.runs.filter(r => r.status === 'queued').length, record_count: { factors: state.factors.length, runs: state.runs.length, published_runs_on_demand: publishedRuns.length, reports: state.reports.length }, storage_bytes: new TextEncoder().encode(JSON.stringify(state)).length, storage_size_basis: '当前完整记录序列化为 UTF-8 的大小，不是数据库物理占用或浏览器配额', data_sha256: sha256, source: data.source, capabilities: { python_server: false, cloud_database: false, broker_trading: false, cross_device_sync: false, browser_calculation: true }, issues };
     return { mode: 'public', checked_at: now(), start_date: parsed.dates[0], end_date: parsed.dates.at(-1), dates_count: parsed.dates.length, stock_count: parsed.symbols.length, row_count: parsed.rows, source: data.source, data_sha256: sha256, datasets: [{ name: '公开固定股票样本 · 未复权日线', path: base() + 'research/public-market.json', start: parsed.dates[0], end: parsed.dates.at(-1), status: 'available', rows: parsed.rows, rows_scope: `实际读取全部 ${parsed.rows} 条证券日记录；固定 ${parsed.symbols.length} 股，不代表全 A 股` }], universe: data.universe, issues, sampled_checks: [parsed.dates[0], parsed.dates.at(-1)!].map(date => ({ date, rows: data.bars.filter(b => b.date === date).length, unique_codes: new Set(data.bars.filter(b => b.date === date).map(b => b.symbol)).size, duplicate_keys: 0, missing_ohlcv: 0 })), unit_policy: { open: '元，未复权', high: '元，未复权', low: '元，未复权', close: '元，未复权', volume: '股，原始手数×100', amount: '缺失（null），不参与计算' }, fields: FIELDS, ...storageInfo(), storage_scope: '公式、策略、运行与报告只保存于本浏览器，不自动跨设备同步' };
   }
   if (collection === 'snapshot' && method === 'GET') return { schema: 'quant.public.snapshot', version: 1, exported_at: now(), ...storageInfo(), storage_scope: '浏览器本机；包含全部历史版本、行情快照和运行结果', state: read() };

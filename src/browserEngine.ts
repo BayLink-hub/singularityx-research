@@ -1,192 +1,12 @@
-/** Public price-research engine. No private files, eval, Function, or imports from user code. */
-export type Row = Record<string, any>;
-export type Matrix = number[][];
-export type Expr = { type: 'constant'; value: number } | { type: 'name'; id: string } |
-  { type: 'unary'; operator: string; operand: Expr } |
-  { type: 'binary' | 'compare'; operator: string; left: Expr; right: Expr } |
-  { type: 'call'; function: string; args: Expr[] };
-export type FactorAST = { schema: 'quant.factor.ast'; version: 1; kind: 'restricted'; output: 'factor'; body: { type: 'assign'; target: string; value: Expr }[] };
+/** Public price research. Formula interpretation lives in the shared safe language. */
+import { validateCode, evaluateCode, ranks, finite, mean, std, correlation, binary, languageOperators } from './factorLanguage';
+import { augmentResearch } from './researchAnalytics';
+import type { Row, Matrix } from './factorLanguage';
+export * from './factorLanguage';
 export interface PublicMarket { source: Row; universe: { symbol: string; name: string; exchange: string }[]; bars: { date: string; symbol: string; open: number; high: number; low: number; close: number; volume: number; amount: number | null }[]; benchmark: { date: string; close: number }[]; coverage: { start: string; end: string } }
-export const ENGINE_VERSION = 'public-price-1.0.0';
-export const FIELDS = ['open', 'high', 'low', 'close', 'volume', 'amount'];
-const WINDOW_OPS = ['delay', 'returns', 'ts_mean', 'ts_std', 'ts_sum', 'ts_min', 'ts_max'];
-const UNARY_OPS = ['rank', 'zscore', 'abs', 'log', 'sign'];
-const OPERATORS = [...WINDOW_OPS, ...UNARY_OPS, 'ts_corr', 'where', 'clip'];
-const safeName = /^[A-Za-z][A-Za-z0-9_]{0,47}$/;
-const finite = (value: number) => Number.isFinite(value) ? value : NaN;
-const mean = (x: number[]) => x.length ? x.reduce((a, b) => a + b, 0) / x.length : NaN;
-const std = (x: number[]) => { if (x.length && x.every(v => v === x[0])) return 0; const m = mean(x); return Math.sqrt(mean(x.map(v => (v - m) ** 2))); };
-const numeric = (n: number) => { if (!Number.isFinite(n) || Math.abs(n) > 1e9) throw new Error('常量及常量运算结果须为绝对值不超过 1e9 的有限数字'); return n; };
+export const ENGINE_VERSION = 'public-price-2.0.0';
+export const PUBLIC_FIELDS = ['open', 'high', 'low', 'close', 'volume', 'amount'];
 const isoDate = (value: unknown): value is string => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value + 'T00:00:00Z')) && new Date(value + 'T00:00:00Z').toISOString().slice(0, 10) === value;
-const binary = (op: string, a: number, b: number): number => {
-  if (!Number.isFinite(a) || !Number.isFinite(b)) return NaN;
-  switch (op) { case '+': return finite(a + b); case '-': return finite(a - b); case '*': return finite(a * b); case '/': return b === 0 ? NaN : finite(a / b); case '<': return +(a < b); case '<=': return +(a <= b); case '>': return +(a > b); case '>=': return +(a >= b); case '==': return +(a === b); case '!=': return +(a !== b); default: throw new Error('不支持的运算'); }
-};
-
-/** Small Pratt parser. Tokens are consumed exactly; properties, strings and arbitrary calls cannot enter the AST. */
-class Parser {
-  tokens: string[] = []; at = 0; nodes = 0;
-  constructor(source: string) {
-    let remaining = source;
-    while (remaining.trim()) {
-      const match = /^\s*(?:(\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z][A-Za-z0-9_]*)|(<=|>=|==|!=|[+\-*/(),<>]))/.exec(remaining);
-      if (!match) throw new Error('仅允许数值、字段、赋值及白名单算子；属性、索引、字符串和任意 Python/JS 禁止执行');
-      this.tokens.push(match[1] || match[2] || match[3]); remaining = remaining.slice(match[0].length);
-      if (this.tokens.length > 512) throw new Error('表达式过长');
-    }
-  }
-  pop() { const token = this.tokens[this.at++]; if (token === undefined) throw new Error('表达式不完整'); return token; }
-  expression(min = 0, depth = 0): Expr {
-    if (depth > 36 || ++this.nodes > 256) throw new Error('表达式嵌套或节点数超限，请拆分步骤');
-    const token = this.pop(); let left: Expr;
-    if (/^(?:\d|\.)/.test(token)) left = { type: 'constant', value: numeric(Number(token)) };
-    else if (token === '-' || token === '+') left = { type: 'unary', operator: token, operand: this.expression(4, depth + 1) };
-    else if (token === '(') { left = this.expression(0, depth + 1); if (this.pop() !== ')') throw new Error('缺少右括号'); }
-    else if (safeName.test(token)) {
-      if (this.tokens[this.at] === '(') {
-        if (!OPERATORS.includes(token)) throw new Error(`不支持算子 ${token}`);
-        this.at++; const args: Expr[] = [];
-        if (this.tokens[this.at] !== ')') { while (true) { args.push(this.expression(0, depth + 1)); if (this.tokens[this.at] !== ',') break; this.at++; } }
-        if (this.pop() !== ')') throw new Error('算子参数或括号不正确');
-        left = { type: 'call', function: token, args };
-      } else left = { type: 'name', id: token };
-    } else throw new Error('非法表达式');
-    const priority: Record<string, number> = { '<': 1, '<=': 1, '>': 1, '>=': 1, '==': 1, '!=': 1, '+': 2, '-': 2, '*': 3, '/': 3 };
-    while (this.at < this.tokens.length) {
-      const op = this.tokens[this.at], precedence = Object.hasOwn(priority, op) ? priority[op] : undefined;
-      if (precedence === undefined || precedence < min) break;
-      this.at++; const right = this.expression(precedence + 1, depth + 1);
-      left = { type: precedence === 1 ? 'compare' : 'binary', operator: op, left, right };
-      if (++this.nodes > 256) throw new Error('语法节点过多');
-    }
-    return left;
-  }
-}
-type Info = { kind: 'scalar' | 'matrix' | 'condition'; value?: number; lookback: number; deps: string[] };
-function infer(node: Expr, env: Map<string, Info>): Info {
-  const scalar = (value: number): Info => ({ kind: 'scalar', value: numeric(value), lookback: 0, deps: [] });
-  if (node.type === 'constant') return scalar(node.value);
-  if (node.type === 'name') { const info = env.get(node.id); if (!info) throw new Error(`未知字段或未定义变量 ${node.id}；公开数据没有复权价、换手率或流通市值`); return info; }
-  if (node.type === 'unary') { const info = infer(node.operand, env); if (info.kind === 'condition') throw new Error('条件只能用于 where'); return info.kind === 'scalar' ? scalar(node.operator === '-' ? -info.value! : info.value!) : info; }
-  const items = node.type === 'call' ? node.args.map(x => infer(x, env)) : [infer(node.left, env), infer(node.right, env)];
-  let lookback = Math.max(0, ...items.map(x => x.lookback));
-  const deps = Array.from(new Set(items.flatMap(x => x.deps))).sort();
-  if (node.type === 'binary' || node.type === 'compare') {
-    if (items.some(x => x.kind === 'condition')) throw new Error('不支持链式条件或条件算术');
-    if (node.type === 'compare') { if (!deps.length) throw new Error('比较须使用数据字段'); return { kind: 'condition', lookback, deps }; }
-    if (node.operator === '/' && items[1].kind === 'scalar' && items[1].value === 0) throw new Error('不能除以常量 0');
-    return items.every(x => x.kind === 'scalar') ? scalar(binary(node.operator, items[0].value!, items[1].value!)) : { kind: 'matrix', lookback, deps };
-  }
-  if (node.type !== 'call') throw new Error('未知语法节点');
-  const name = node.function, count = WINDOW_OPS.includes(name) ? 2 : UNARY_OPS.includes(name) ? 1 : 3;
-  if (items.length !== count) throw new Error(`${name} 需要 ${count} 个位置参数`);
-  if (name === 'where') { if (items[0].kind !== 'condition' || items.slice(1).some(x => x.kind === 'condition')) throw new Error('where 参数类型不正确'); }
-  else if (items[0].kind !== 'matrix') throw new Error(`${name} 的第一个参数须是数据矩阵`);
-  if (WINDOW_OPS.includes(name) || name === 'ts_corr') {
-    const window = items.at(-1)!;
-    if (window.kind !== 'scalar' || !Number.isInteger(window.value) || window.value! < 1 || window.value! > 252 || (['ts_corr', 'ts_std'].includes(name) && window.value! < 2)) throw new Error('窗口须为 1–252 的整数（标准差/相关至少 2），禁止未来 shift');
-    if (name === 'ts_corr' && items[1].kind !== 'matrix') throw new Error('相关算子需要两个数据字段');
-    lookback += ['delay', 'returns'].includes(name) ? window.value! : window.value! - 1;
-  }
-  if (name === 'clip' && (items[1].kind !== 'scalar' || items[2].kind !== 'scalar' || items[1].value! >= items[2].value!)) throw new Error('clip 上下界须是递增常量');
-  return { kind: 'matrix', lookback, deps };
-}
-function render(node: Expr): string {
-  if (node.type === 'constant') return String(node.value);
-  if (node.type === 'name') return node.id;
-  if (node.type === 'unary') return `(${node.operator}${render(node.operand)})`;
-  if (node.type === 'call') return `${node.function}(${node.args.map(render).join(', ')})`;
-  return `(${render(node.left)} ${node.operator} ${render(node.right)})`;
-}
-function walk(node: Expr): Expr[] { return [node, ...(node.type === 'call' ? node.args.flatMap(walk) : node.type === 'unary' ? walk(node.operand) : node.type === 'binary' || node.type === 'compare' ? [...walk(node.left), ...walk(node.right)] : [])]; }
-export function validateCode(code: string): Row {
-  try {
-    if (typeof code !== 'string' || new TextEncoder().encode(code).length > 12000) throw new Error('代码须为最多 12KB 的文本');
-    const lines = code.split(/\r?\n/).map(x => x.replace(/#.*/, '').trim()).filter(Boolean);
-    if (!lines.length || lines.length > 32) throw new Error('需要 1–32 行赋值，最后输出 factor');
-    const env = new Map<string, Info>(FIELDS.map(f => [f, { kind: 'matrix', lookback: 0, deps: [f] }]));
-    const ast: FactorAST = { schema: 'quant.factor.ast', version: 1, kind: 'restricted', output: 'factor', body: [] };
-    const steps: Row[] = [], parameters: Row = {}; let nodeCount = 0;
-    lines.forEach((line, index) => {
-      const assignment = /^([A-Za-z][A-Za-z0-9_]{0,47})\s*=\s*(?!=)(.+)$/.exec(line);
-      if (!assignment) throw new Error(`第 ${index + 1} 行只允许 name = expression`);
-      const [, target, expression] = assignment;
-      if (env.has(target) || OPERATORS.includes(target)) throw new Error(`不能重复赋值或覆盖字段/算子 ${target}`);
-      const parser = new Parser(expression), value = parser.expression();
-      if (parser.at !== parser.tokens.length) throw new Error(`第 ${index + 1} 行存在未识别内容`);
-      nodeCount += parser.nodes; if (nodeCount > 256) throw new Error('程序超过 256 个语法节点');
-      const info = infer(value, env);
-      if (info.lookback > 252) throw new Error(`累计历史依赖 ${info.lookback} 日超过 252 日上限`);
-      if (target === 'factor' && (index !== lines.length - 1 || info.kind !== 'matrix')) throw new Error('最后一行 factor 必须是数值矩阵');
-      env.set(target, info); if (info.kind === 'scalar') parameters[target] = info.value;
-      const nodes = walk(value), calls = nodes.filter((x): x is Extract<Expr, { type: 'call' }> => x.type === 'call');
-      const windows = calls.filter(x => WINDOW_OPS.includes(x.function) || x.function === 'ts_corr').map(x => infer(x.args.at(-1)!, env).value!);
-      steps.push({ index: index + 1, target, code: `${target} = ${render(value)}`, kind: target === 'factor' ? 'output' : info.kind === 'scalar' ? 'parameter' : 'transform', operation: calls.map(x => x.function).join(', ') || value.type, inputs: [...new Set(nodes.filter((x): x is Extract<Expr, { type: 'name' }> => x.type === 'name').map(x => x.id))], dependencies: info.deps, window: windows.length ? Math.max(...windows) : null, lookback_days: info.lookback });
-      ast.body.push({ type: 'assign', target, value });
-    });
-    if (ast.body.at(-1)?.target !== 'factor') throw new Error('最后一行必须为 factor = ...');
-    return { valid: true, ast, code: steps.map(x => x.code).join('\n'), dependencies: [...new Set(steps.flatMap(x => x.dependencies))].sort(), parameters, steps, warmup_days: Math.max(...steps.map(x => x.lookback_days)), errors: [] };
-  } catch (error) { return { valid: false, ast: null, code, dependencies: [], parameters: {}, steps: [], warmup_days: null, errors: [error instanceof Error ? error.message : String(error)] }; }
-}
-
-export function ranks(values: number[]): number[] {
-  const ordered = values.map((value, i) => ({ value, i })).filter(x => Number.isFinite(x.value)).sort((a, b) => a.value - b.value || a.i - b.i);
-  const result = values.map(() => NaN); let i = 0;
-  while (i < ordered.length) { let j = i + 1; while (j < ordered.length && ordered[j].value === ordered[i].value) j++; for (let k = i; k < j; k++) result[ordered[k].i] = (i + 1 + j) / 2; i = j; }
-  return result;
-}
-function correlation(a: number[], b: number[]): number {
-  if (a.length < 2 || a.length !== b.length || a.every(v => v === a[0]) || b.every(v => v === b[0])) return NaN;
-  const ma = mean(a), mb = mean(b); let xy = 0, xx = 0, yy = 0;
-  a.forEach((x, i) => { xy += (x - ma) * (b[i] - mb); xx += (x - ma) ** 2; yy += (b[i] - mb) ** 2; });
-  return xx > 0 && yy > 0 ? finite(xy / Math.sqrt(xx * yy)) : NaN;
-}
-export function evaluateCode(code: string, frames: Record<string, Matrix>, frozenAst?: FactorAST): Matrix {
-  const parsed = validateCode(code); if (!parsed.valid) throw new Error(parsed.errors.join('；'));
-  if (frozenAst && JSON.stringify(frozenAst) !== JSON.stringify(parsed.ast)) throw new Error('冻结 AST 与代码不一致，拒绝执行');
-  const first = frames[parsed.dependencies[0]]; if (!first?.length || !first[0]?.length || first.length * first[0].length > 100000) throw new Error('数据矩阵为空或超过公开浏览器计算上限');
-  const rows = first.length, cols = first[0].length, env = new Map<string, number | Matrix>();
-  const scalarEnv = new Map<string, Info>(Object.entries(parsed.parameters).map(([name, value]) => [name, { kind: 'scalar', value: value as number, lookback: 0, deps: [] }]));
-  const workPerCell = (parsed.ast as FactorAST).body.flatMap(statement => walk(statement.value)).reduce((sum, node) => {
-    if (node.type !== 'call') return sum + (['unary', 'binary', 'compare'].includes(node.type) ? 1 : 0);
-    if (node.function.startsWith('ts_')) return sum + infer(node.args.at(-1)!, scalarEnv).value! * (node.function === 'ts_corr' ? 2 : 1);
-    return sum + (node.function === 'rank' ? Math.max(1, Math.ceil(Math.log2(cols))) : 1);
-  }, 0);
-  const estimatedWork = workPerCell * rows * cols;
-  if (estimatedWork > 20_000_000) throw new Error('公式与数据规模超过浏览器计算预算，请减少滚动步骤或缩短窗口');
-  for (const field of parsed.dependencies) { const value = frames[field]; if (!value || value.length !== rows || value.some(x => x.length !== cols)) throw new Error(`字段 ${field} 缺失或未对齐`); if (!value.some(row => row.some(Number.isFinite))) throw new Error(`字段 ${field} 在当前公开行情中完全缺失，不能以 0 或其他代理替代`); env.set(field, value); }
-  const cell = (value: number | Matrix, i: number, j: number) => typeof value === 'number' ? value : value[i][j];
-  const map = (fn: (i: number, j: number) => number): Matrix => Array.from({ length: rows }, (_, i) => Array.from({ length: cols }, (_, j) => finite(fn(i, j))));
-  function execute(node: Expr): number | Matrix {
-    if (node.type === 'constant') return node.value;
-    if (node.type === 'name') return env.get(node.id)!;
-    if (node.type === 'unary') { const x = execute(node.operand); return typeof x === 'number' ? (node.operator === '-' ? -x : x) : map((i, j) => node.operator === '-' ? -x[i][j] : x[i][j]); }
-    if (node.type === 'binary' || node.type === 'compare') { const a = execute(node.left), b = execute(node.right); return typeof a === 'number' && typeof b === 'number' ? binary(node.operator, a, b) : map((i, j) => binary(node.operator, cell(a, i, j), cell(b, i, j))); }
-    if (node.type !== 'call') throw new Error('未知语法节点');
-    const args = node.args.map(execute), x = args[0] as Matrix, name = node.function, n = args.at(-1) as number;
-    if (name === 'delay') return map((i, j) => i >= n ? x[i - n][j] : NaN);
-    if (name === 'returns') return map((i, j) => i >= n ? binary('/', x[i][j], x[i - n][j]) - 1 : NaN);
-    if (name.startsWith('ts_')) return map((i, j) => {
-      if (i < n - 1) return NaN;
-      const values = Array.from({ length: n }, (_, k) => x[i - n + 1 + k][j]);
-      if (values.some(v => !Number.isFinite(v))) return NaN;
-      if (name === 'ts_mean') return mean(values); if (name === 'ts_sum') return values.reduce((a, b) => a + b, 0);
-      if (name === 'ts_std') return std(values); if (name === 'ts_min') return Math.min(...values); if (name === 'ts_max') return Math.max(...values);
-      const y = args[1] as Matrix, other = Array.from({ length: n }, (_, k) => y[i - n + 1 + k][j]);
-      return other.every(Number.isFinite) ? correlation(values, other) : NaN;
-    });
-    if (name === 'rank') return x.map(row => { const rank = ranks(row), count = rank.filter(Number.isFinite).length; return rank.map(v => v / count); });
-    if (name === 'zscore') return x.map(row => { const usable = row.filter(Number.isFinite), m = mean(usable), s = std(usable); return row.map(v => s > 0 ? finite((v - m) / s) : NaN); });
-    if (name === 'abs') return map((i, j) => Math.abs(x[i][j]));
-    if (name === 'sign') return map((i, j) => Math.sign(x[i][j]));
-    if (name === 'log') return map((i, j) => x[i][j] > 0 ? Math.log(x[i][j]) : NaN);
-    if (name === 'clip') return map((i, j) => Math.max(args[1] as number, Math.min(args[2] as number, x[i][j])));
-    if (name === 'where') return map((i, j) => !Number.isFinite(x[i][j]) ? NaN : cell(x[i][j] ? args[1] : args[2], i, j));
-    throw new Error('未实现算子');
-  }
-  parsed.ast.body.forEach((statement: FactorAST['body'][number]) => env.set(statement.target, execute(statement.value)));
-  return (env.get('factor') as Matrix).map(row => row.slice());
-}
 
 export function marketFrames(data: PublicMarket) {
   if (!data?.source?.provider || !data.source.url || !Array.isArray(data.universe) || !Array.isArray(data.bars) || !data.bars.length) throw new Error('公开行情文件缺少来源或数据');
@@ -196,12 +16,12 @@ export function marketFrames(data: PublicMarket) {
   const benchmarkDates = new Set<string>();
   for (const point of data.benchmark || []) { if (!isoDate(point.date) || !Number.isFinite(point.close) || point.close <= 0 || benchmarkDates.has(point.date)) throw new Error('基准存在重复日期或无效报价'); benchmarkDates.add(point.date); }
   const si = new Map(symbols.map((s, i) => [s, i])), di = new Map(dates.map((d, i) => [d, i]));
-  const frames = Object.fromEntries(FIELDS.map(field => [field, dates.map(() => symbols.map(() => NaN))])) as Record<string, Matrix>, keys = new Set();
+  const frames = Object.fromEntries(PUBLIC_FIELDS.map(field => [field, dates.map(() => symbols.map(() => NaN))])) as Record<string, Matrix>, keys = new Set();
   for (const bar of data.bars) {
     if (!isoDate(bar.date) || !si.has(bar.symbol)) throw new Error('行情日期或证券代码不合法');
     const key = bar.date + '|' + bar.symbol; if (keys.has(key)) throw new Error(`行情存在重复主键 ${key}`); keys.add(key);
-    if (FIELDS.filter(f => f !== 'amount').some(f => !Number.isFinite((bar as any)[f])) || Math.min(bar.open, bar.high, bar.low, bar.close) <= 0 || bar.low > Math.min(bar.open, bar.close) || bar.high < Math.max(bar.open, bar.close) || bar.volume < 0 || (bar.amount !== null && (!Number.isFinite(bar.amount) || bar.amount < 0))) throw new Error(`行情字段异常 ${key}`);
-    for (const field of FIELDS) frames[field][di.get(bar.date)!][si.get(bar.symbol)!] = (bar as any)[field] === null ? NaN : (bar as any)[field];
+    if (PUBLIC_FIELDS.filter(f => f !== 'amount').some(f => !Number.isFinite((bar as any)[f])) || Math.min(bar.open, bar.high, bar.low, bar.close) <= 0 || bar.low > Math.min(bar.open, bar.close) || bar.high < Math.max(bar.open, bar.close) || bar.volume < 0 || (bar.amount !== null && (!Number.isFinite(bar.amount) || bar.amount < 0))) throw new Error(`行情字段异常 ${key}`);
+    for (const field of PUBLIC_FIELDS) frames[field][di.get(bar.date)!][si.get(bar.symbol)!] = (bar as any)[field] === null ? NaN : (bar as any)[field];
   }
   return { symbols, dates, frames, rows: data.bars.length };
 }
@@ -311,7 +131,9 @@ export async function runBrowserResearch(data: PublicMarket, config: Row, factor
   const holdings = [...positions].map(([j, p]) => ({ ts_code: symbols[j], quantity: p.quantity, quantity_unit: '股（100股整手）', price: p.lastPrice, market_value: p.quantity * p.lastPrice, weight: p.quantity * p.lastPrice / previousEquity, last_quote_date: p.lastQuote, stale: p.lastQuote !== last.date }));
   const warnings = [...publicWarnings]; if (!trades.length) warnings.push('本次没有成交，零交易结果不能作为策略有效性的证据。'); if (!benchmarkComplete) warnings.push('基准区间报价不完整，未生成基准曲线或超额收益。'); if (staleDays) warnings.push(`有 ${staleDays} 天持仓缺报价，使用最后已知估值，不能视为已清算收益。`);
   await checkpoint(98, '完成真实计算并准备保存研究证据');
-  return jsonSafe({ metrics, curves, ic, groups, yearly: period(4, 'year'), monthly: period(7, 'month'), trades, holdings, diagnostics: { coverage, group_coverage: groupCoverage, rejected_orders: rejected, initial_day_cash_only: true }, warnings, provenance: { engine: ENGINE_VERSION, source: data.source, universe: data.universe, sample_status: '固定公开小样本的探索研究，非全A或样本外验证', config: c, factor_versions: factors.map(f => ({ id: f.id, version: f.version, name: f.name, code: f.code, ast: f.ast, weight: f.weight ?? 1 })), information_time: 't收盘形成信号→t+1开盘；首个研究日保持现金', quantity_unit: '股（100股整手，缺少公司行动调整）', return_basis: '未复权价格收益', grouping: '信号日先分组；每horizon日一批不重叠开盘至开盘收益，缺报价不重选成员', icir: '日度IC均值/总体标准差×sqrt(252)，重叠持有期导致相关性，非显著性检验', source_start: dates[0], source_end: dates.at(-1) } });
+  const result = jsonSafe({ metrics, curves, ic, groups, yearly: period(4, 'year'), monthly: period(7, 'month'), trades, holdings, diagnostics: { coverage, group_coverage: groupCoverage, rejected_orders: rejected, initial_day_cash_only: true }, warnings, provenance: { engine: ENGINE_VERSION, source: data.source, universe: data.universe, sample_status: '固定公开小样本的探索研究，非全A或样本外验证', config: c, factor_versions: factors.map(f => ({ id: f.id, version: f.version, name: f.name, code: f.code, ast: f.ast, weight: f.weight ?? 1 })), information_time: 't收盘形成信号→t+1开盘；首个研究日保持现金', quantity_unit: '股（100股整手，缺少公司行动调整）', return_basis: '未复权价格收益', grouping: '信号日先分组；每horizon日一批不重叠开盘至开盘收益，缺报价不重选成员', icir: '日度IC均值/总体标准差×sqrt(252)，重叠持有期导致相关性，非显著性检验', source_start: dates[0], source_end: dates.at(-1) } });
+  result.analytics = augmentResearch(result, data, c, {dates, symbols, values: scores});
+  return jsonSafe(result);
 }
 
 export function publicSeeds(): Row[] {
@@ -326,7 +148,4 @@ export function publicSeeds(): Row[] {
   const stamp = new Date().toISOString();
   return definitions.map(([id, name, category, description, code]) => ({ id, name, category, description, ...validateCode(code), source_kind: 'native_ast', status: 'ready', version: 1, created_at: stamp, updated_at: stamp, source_path: '公开浏览器因子定义', ...(id === 'public_alpha101' ? { source_reference: 'https://arxiv.org/abs/1601.00991', paper_factor_number: 101, replication_method: '手工确认公开公式；非 LLM 解读或有效性认证' } : {}), limitations: publicWarnings.slice(0, 2), metrics: null, legacy_metrics: null }));
 }
-export function publicOperators(): Row[] {
-  const descriptions: Record<string, string> = { delay: '过去 n 个交易日，禁止未来位移。', returns: 'x/delay(x,n)-1；未复权价格可能包含除权跳变。', ts_mean: '完整 n 日窗口均值。', ts_std: '完整 n 日总体标准差。', ts_sum: '完整 n 日求和。', ts_min: '完整 n 日最小值。', ts_max: '完整 n 日最大值。', ts_corr: '两字段完整 n 日 Pearson 相关。', rank: '按日横截面百分位秩，并列取平均。', zscore: '按日标准化，常量截面保持缺失。', abs: '绝对值。', log: '自然对数，非正数为空。', sign: '数值符号。', where: '按比较条件选择值，缺失条件保持缺失。', clip: '按照常数上下界截断。' };
-  return [...OPERATORS.map(name => ({ name, category: WINDOW_OPS.includes(name) || name === 'ts_corr' ? '时间序列' : '截面与数值', signature: `${name}(${WINDOW_OPS.includes(name) ? 'x, n' : name === 'ts_corr' ? 'x, y, n' : name === 'where' ? 'condition, a, b' : name === 'clip' ? 'x, lower, upper' : 'x'})`, description: descriptions[name] })), ...FIELDS.map(name => ({ name, category: '字段', signature: name, description: name === 'amount' ? '成交额字段在当前公开源中缺失（null），依赖它的公式会拒绝运行；不以0或估计值冒充。' : name === 'volume' ? '日成交量，单位股（原始手数已换算）；t日收盘后可得。' : `未复权${({ open: '开盘', high: '最高', low: '最低', close: '收盘' } as Row)[name]}价，单位元；统一按t日收盘信息处理。` }))];
-}
+export const publicOperators = languageOperators;

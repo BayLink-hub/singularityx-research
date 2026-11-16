@@ -6,9 +6,9 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const ts = require('../node_modules/typescript');
 const root = path.resolve(__dirname, '..');
-require.extensions['.ts'] = (module, filename) => {
+require.extensions['.tsx'] = require.extensions['.ts'] = (module, filename) => {
   const source = fs.readFileSync(filename, 'utf8').replace(/\bimport\.meta\b/g, '({env:{BASE_URL:"/"}})');
-  module._compile(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, filename);
+  module._compile(ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX } }).outputText, filename);
 };
 const engine = require('../src/browserEngine.ts');
 const rawMarket = fs.readFileSync(path.join(root, 'public/research/public-market.json'), 'utf8');
@@ -20,7 +20,7 @@ test('restricted parser rejects code injection, future reads, excessive depth an
   for (const code of [
     "import os\nfactor = close", "factor = eval(close)", "factor = Function(close)", "factor = close.constructor", "factor = close[0]",
     "factor = delay(close, -1)", "n = 1 - 2\nfactor = returns(close, n)", "factor = ts_mean(close, 999999999)",
-    "factor = delay(ts_mean(close, 252), 252)", "factor = close ** 20", "factor = close; print(close)", "factor = close constructor",
+    "factor = delay(ts_mean(close, 252), 252)", "factor = close ** (10 ** 1000000000)", "factor = close; print(close)", "factor = close constructor",
     "close = volume\nfactor = close", "factor = 1", "factor = __proto__", "factor = close / 0", "factor = " + '-'.repeat(45) + 'close',
   ]) assert.equal(engine.validateCode(code).valid, false, code);
   const parsed = engine.validateCode('window = 20\nx = returns(close, 1)\nfactor = ts_std(x, window)');
@@ -115,9 +115,9 @@ test('public API imports only verified public cases, preserves revisions, comput
   global.fetch = async url => { const name = String(url).split('/').pop(); const file = path.join(root, 'public/research', name); return fs.existsSync(file) ? new Response(fs.readFileSync(file), { status: 200 }) : new Response('', { status: 404 }); };
   const { publicRequest } = require('../src/publicApi.ts');
   assert.equal((await publicRequest('/session')).mode, 'public');
-  const factors = await publicRequest('/factors'); assert.equal(factors.length, engine.publicSeeds().length); assert.ok(factors.every(f => f.source_kind === 'native_ast'));
+  const factors = await publicRequest('/factors'); const alphaCatalog=JSON.parse(fs.readFileSync(path.join(root,'public/research/alpha101.json'))); const workCatalog=JSON.parse(fs.readFileSync(path.join(root,'public/research/work-catalog.json'))); assert.equal(factors.length,engine.publicSeeds().length+alphaCatalog.factors.length+workCatalog.factors.length); assert.ok(factors.some(f=>f.source_kind==='native_ast')); assert.ok(factors.some(f=>f.id==='alpha101_001')); 
   const published = JSON.parse(fs.readFileSync(path.join(root, 'public/research/public-runs.json')));
-  const initialRuns = await publicRequest('/runs'); assert.equal(initialRuns.length, published.runs.length); assert.ok(initialRuns.every(r => r.source_kind === 'published_public_run'));
+  const initialRuns = await publicRequest('/runs'); assert.equal(initialRuns.length, published.runs.length + JSON.parse(fs.readFileSync(path.join(root,'public/research/alpha101-runs.json'))).runs.length); assert.ok(initialRuns.every(r => r.source_kind === 'published_public_run'));
   const original = await publicRequest('/factors/' + factors[0].id);
   const changed = await publicRequest('/factors/' + original.id, 'PUT', { name: original.name, category: original.category, description: '测试版本，不影响历史结果', code: original.code, base_version: 1 });
   assert.equal(changed.version, 2); assert.equal(changed.versions.length, 2);
@@ -132,4 +132,32 @@ test('public API imports only verified public cases, preserves revisions, comput
   const beforeQuota = localStorage.getItem('singularityx.public.research.v1'); localStorage.limit = 1;
   await assert.rejects(publicRequest('/reports', 'POST', { title: '不应成功写入', run_id: run.id, body: 'quota' }), /容量已满/);
   assert.equal(localStorage.getItem('singularityx.public.research.v1'), beforeQuota); localStorage.limit = Infinity;
+});
+
+
+test('backend evidence retains missing sessions, independent cohort returns and frozen annualization', () => {
+  const { backendEvidence } = require('../src/FactorEvidence.tsx');
+  const result = {
+    curves: [{date:'2024-01-02',nav:1,benchmark:1},{date:'2024-01-03',nav:1.1,benchmark:1.01},{date:'2024-01-04',nav:1.05,benchmark:1.02}],
+    ic: [{date:'2024-01-02',ic:.2,rank_ic:.3},{date:'2024-01-04',ic:.4,rank_ic:.1}],
+    groups: [{date:'2024-01-02',Q1:1.1,Q2:1},{date:'2024-01-03',Q1:null,Q2:null},{date:'2024-01-04',Q1:null,Q2:null}],
+    metrics: {annualized_return:3,total_return:.05,max_drawdown:-.1,sortino:2,calmar:30},
+    monthly: [{month:'2024-01',return:.05,days:3}],yearly:[{year:'2024',return:.05,days:3}],
+    diagnostics: {
+      coverage:[{date:'2024-01-02'},{date:'2024-01-03'},{date:'2024-01-04'}],
+      group_returns:[{date:'2024-01-02',Q1:.1,Q2:0},{date:'2024-01-03',Q1:null,Q2:null},{date:'2024-01-04',Q1:.2,Q2:.4}],
+      group_turnover:[{date:'2024-01-02',Q1:1,Q2:1},{date:'2024-01-03',Q1:.2,Q2:.4},{date:'2024-01-04',Q1:.3,Q2:.5}],
+    }
+  };
+  const before=JSON.stringify(result),a=backendEvidence(result);
+  assert.equal(JSON.stringify(result),before);
+  assert.equal(a.ic.daily.length,3);assert.equal(a.ic.daily[1].ic,null);assert.equal(a.ic.summary.ic.count,2);
+  assert.equal(a.groups.summary[0].observations,2);assert.equal(a.groups.summary[0].missing_periods,1);
+  assert.equal(a.groups.summary[0].cumulative_return,null);assert.equal(a.groups.summary[0].mean_turnover,.5);
+  assert.ok(Math.abs(a.groups.summary[0].mean_return-.15)<1e-14);
+  assert.ok(Math.abs(a.groups.monotonicity-1)<1e-14);assert.equal(a.groups.strictly_increasing,true);assert.equal(a.groups.long_short[2].return,.2);
+  assert.equal(a.metrics.annual_return,3);assert.equal(a.performance.metrics.annual_return,3);assert.equal(a.metrics.sortino,2);assert.equal(a.metrics.calmar,30);
+  assert.equal(a.performance.monthly[0].return,.05);assert.equal(a.performance.yearly[0].observations,3);
+  assert.equal(a.unavailable.group_turnover,undefined);assert.ok(a.groups.reason.includes('缺失'));
+  const old=structuredClone(result);delete old.diagnostics.group_returns;const older=backendEvidence(old);assert.equal(older.metrics.annual_return,3);assert.equal(older.performance.monthly[0].return,.05);
 });
