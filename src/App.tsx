@@ -43,7 +43,7 @@ export default function App() {
         <aside className="sidebar"><a href="#/factors" className="brand"><BrandLogo/><div><strong>SINGULARITYX</strong><small>零界演化</small></div></a>
             <nav aria-label="主导航">{navItems.map(item => <a key={item.path} title={item.label} href={'#' + item.path} className={current.path === item.path ? 'active' : ''}><item.icon size={21}/><span>{item.label}</span></a>)}</nav>
             <button className="sidebar-collapse" aria-label={collapsed ? '展开侧栏' : '收起侧栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <ChevronRight size={19}/> : <ChevronLeft size={19}/>}</button>
-            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.5.0</small></div>
+            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.5.1</small></div>
         </aside>{sidebar && <button className="sidebar-shade" aria-label="关闭导航" onClick={() => setSidebar(false)}/>}
         <div className="main-shell"><header className="topbar"><div className="breadcrumb"><button className="icon-button menu-button" aria-label="展开导航" onClick={() => setSidebar(!sidebar)}><Menu size={20}/></button><a href="#/factors">首页</a><span>/</span><strong>{current.label}</strong></div><div className="topbar-right"><a href="#/engine" className="text-button" title="切换公开样本与本机完整数据"><Tag tone="amber">{modeLabel}</Tag></a><Tag tone="green"><current.icon size={13}/>{current.label}</Tag>{!isPublic && !['development', 'local_bridge'].includes(session.data?.mode) && <button title="退出登录" className="icon-button" onClick={async () => { try { await api('/logout', 'POST'); session.refresh(); } catch (e) { notify(errorMessage(e)); } }}><LogOut size={16}/></button>}</div></header>
             <main key={path} className="workspace">
