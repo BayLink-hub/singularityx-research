@@ -77,9 +77,16 @@ export function Pagination({ total, page, onChange, size = 10 }: {
     onChange: (n: number) => void;
     size?: number;
 }) { const pages = Math.max(1, Math.ceil(total / size)); const visible = Array.from({ length: pages }, (_, i) => i + 1).filter(n => n === 1 || n === pages || Math.abs(n - page) <= 1); return <div className="pagination"><span>共 {total} 条记录 · 每页 {size} 条</span><div><button aria-label="上一页" className="icon-button" disabled={page <= 1} onClick={() => onChange(page - 1)}><ChevronLeft size={16}/></button>{visible.map((n, i) => <span className="page-number-wrap" key={n}>{i > 0 && n - visible[i - 1] > 1 && <span className="page-ellipsis">…</span>}<button aria-label={'第 ' + n + ' 页'} aria-current={page === n ? 'page' : undefined} className={'page-number ' + (page === n ? 'active' : '')} onClick={() => onChange(n)}>{n}</button></span>)}<button aria-label="下一页" className="icon-button" disabled={page >= pages} onClick={() => onChange(page + 1)}><ChevronRight size={16}/></button></div></div>; }
-export function MetricGrid({ metrics }: {
+export function MetricGrid({ metrics, result = {} }: {
     metrics: RecordData;
+    result?: RecordData;
 }) {
+    const label = (key: string) => {
+        if (!/^(?:rank_)?ic_?ir(?:_daily|_annualized)?$/.test(key)) return metricNames[key] || key;
+        const definition = String(result.diagnostics?.metric_definitions?.[key] || (key === 'ic_ir' ? result.diagnostics?.ic_ir_definition : '') || result.provenance?.[key] || (key === 'ic_ir' && String(result.provenance?.engine || '').startsWith('public-price-') ? result.provenance?.icir : '') || '');
+        const basis = result.legacy ? '原口径' : key.endsWith('_daily') || /未年化|非年化/.test(definition) ? '非年化' : key.endsWith('_annualized') || /年化|sqrt\(252\)|√252/.test(definition) ? '年化' : '原口径';
+        return (key.startsWith('rank_') ? 'RankICIR' : 'ICIR') + ' · ' + basis;
+    };
     const entries = Object.entries(metrics || {}).filter(([, v]) => typeof v !== 'object' || v === null);
     const priority = ['annualized_return', 'annual_return', 'total_return', 'sharpe', 'max_drawdown', 'rank_ic_mean', 'ic_mean', 'ic_ir', 'trade_count'];
     const ordered = [...priority.filter(key => entries.some(([k]) => key === k)).map(key => [key, metrics[key]] as [
@@ -89,7 +96,7 @@ export function MetricGrid({ metrics }: {
     const grid = (items: [
         string,
         any
-    ][]) => <div className="metric-grid">{items.map(([key, value]) => <div className="metric" key={key}><span title={key}>{metricNames[key] || key}</span><strong className={typeof value === 'number' && value < 0 ? 'negative' : ''}>{fmt(value, key)}</strong></div>)}</div>;
+    ][]) => <div className="metric-grid">{items.map(([key, value]) => <div className="metric" key={key}><span title={key}>{label(key)}</span><strong className={typeof value === 'number' && value < 0 ? 'negative' : ''}>{fmt(value, key)}</strong></div>)}</div>;
     return <>{grid(ordered.slice(0, 8))}{ordered.length > 8 && <details className="more-metrics"><summary>更多研究指标 · {ordered.length - 8} 项</summary>{grid(ordered.slice(8))}</details>}</>;
 }
 export function JsonView({ value }: {

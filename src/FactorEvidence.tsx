@@ -125,7 +125,7 @@ export function EvidencePanels({result,config={}}: {result:RecordData;config?:Re
   const primary=[
     [legacy?'原档 IC 均值':'Pearson IC 均值',legacy?m.ic_mean:a.ic.summary.ic.mean,'ic'],
     ['RankIC 均值',legacy?null:a.ic.summary.rank_ic.mean,'ic'],
-    ['ICIR · 年化',legacy?m.icir:a.ic.summary.ic.icir_annualized,'number'],
+    [legacy?'ICIR · 原口径':'ICIR · 年化',legacy?m.icir:a.ic.summary.ic.icir_annualized,'number'],
     ['IR · 年化',a.metrics.information_ratio,'number'],
     [legacy?'最高组年化 · 零成本':'策略年化 · 费后',legacy?m.top_group_annual_return_net:(m.annual_return ?? m.annualized_return),'percent'],
     ['平均换手率',a.metrics.mean_turnover,'percent'],
