@@ -112,7 +112,7 @@ test('public API imports only verified public cases, preserves revisions, comput
   // browser persistence is simulated here, so use the same callback contract.
   Object.defineProperty(global, 'navigator', { value: { locks: { request: async (_name, callback) => callback() } }, configurable: true });
   if (!global.crypto) global.crypto = crypto.webcrypto;
-  global.fetch = async url => { const name = String(url).split('/').pop(); const file = path.join(root, 'public/research', name); return fs.existsSync(file) ? new Response(fs.readFileSync(file), { status: 200 }) : new Response('', { status: 404 }); };
+  global.fetch = async url => { const name = String(url).split('/research/')[1]; const file = path.join(root, 'public/research', name); return fs.existsSync(file) ? new Response(fs.readFileSync(file), { status: 200 }) : new Response('', { status: 404 }); };
   const { publicRequest } = require('../src/publicApi.ts');
   assert.equal((await publicRequest('/session')).mode, 'public');
   const factors = await publicRequest('/factors'); const alphaCatalog=JSON.parse(fs.readFileSync(path.join(root,'public/research/alpha101.json'))); const workCatalog=JSON.parse(fs.readFileSync(path.join(root,'public/research/work-catalog.json'))); assert.equal(factors.length,engine.publicSeeds().length+alphaCatalog.factors.length+workCatalog.factors.length); assert.ok(factors.some(f=>f.source_kind==='native_ast')); assert.ok(factors.some(f=>f.id==='alpha101_001')); 

@@ -1,12 +1,24 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { Component, lazy, Suspense, useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { Activity, ArrowRight, BarChart3, BookOpen, Calculator, Check, ChevronLeft, ChevronRight, Database, Download, FileText, FlaskConical, LockKeyhole, LogOut, Menu, Plus, RefreshCw, Save, Settings, ShieldCheck, SlidersHorizontal, Sparkles, X, Zap } from 'lucide-react';
 import { api, downloadFile, errorMessage, go, isPublicBuild, type RecordData, type Run, useApi, useRoute } from './api';
 import { DataTable, Empty, ErrorBox, Field, JsonView, Loading, PageHead, Pagination, Panel, SearchInput, Status, Tag, dateTime, fmt } from './components';
-import { FactorDetail, FactorLibrary } from './Factors';
-import { LocalEngine } from './LocalEngine';
-import { DataQuality } from './DataCenter';
-import { ResearchForm, RunDetail, Runs } from './Research';
-import { OperatorLibrary, IpoCalculator, EventResearch, ReplicationPipeline, SystemStatus } from './ResearchModules';
+const FactorDetail = lazy(() => import('./Factors').then(m => ({ default: m.FactorDetail })));
+const FactorLibrary = lazy(() => import('./Factors').then(m => ({ default: m.FactorLibrary })));
+const LocalEngine = lazy(() => import('./LocalEngine').then(m => ({ default: m.LocalEngine })));
+const DataQuality = lazy(() => import('./DataCenter').then(m => ({ default: m.DataQuality })));
+const ResearchForm = lazy(() => import('./Research').then(m => ({ default: m.ResearchForm })));
+const RunDetail = lazy(() => import('./Research').then(m => ({ default: m.RunDetail })));
+const Runs = lazy(() => import('./Research').then(m => ({ default: m.Runs })));
+const OperatorLibrary = lazy(() => import('./ResearchModules').then(m => ({ default: m.OperatorLibrary })));
+const IpoCalculator = lazy(() => import('./ResearchModules').then(m => ({ default: m.IpoCalculator })));
+const EventResearch = lazy(() => import('./ResearchModules').then(m => ({ default: m.EventResearch })));
+const ReplicationPipeline = lazy(() => import('./ResearchModules').then(m => ({ default: m.ReplicationPipeline })));
+const SystemStatus = lazy(() => import('./ResearchModules').then(m => ({ default: m.SystemStatus })));
+class PageBoundary extends Component<{children: ReactNode}, {failed: boolean}> {
+    state = {failed: false};
+    static getDerivedStateFromError() { return {failed: true}; }
+    render() { return this.state.failed ? <Panel><ErrorBox message="页面未能完整加载，请重新加载后再试。" retry={() => window.location.reload()}/></Panel> : this.props.children; }
+}
 const navItems = [
     { path: '/factors', label: '因子投资研究系统', icon: FlaskConical },
     { path: '/replication', label: 'AI因子复现流水线', icon: Sparkles },
@@ -36,19 +48,19 @@ export default function App() {
     useEffect(() => { setSidebar(false); window.scrollTo(0, 0); }, [path]);
     useEffect(() => { const expired = () => session.refresh(); window.addEventListener('quant-session-expired', expired); return () => window.removeEventListener('quant-session-expired', expired); }, [session.refresh]);
     const current = navItems.find(item => path.startsWith(item.path)) || navItems[0];
-    if (session.loading) return <div className="app-loading"><BrandLogo/><Loading/></div>;
-    if (session.error) return <div className="login-screen"><Panel title="连接研究服务"><ErrorBox message={session.error} retry={session.refresh}/><p className="muted padded">请确认后台服务已启动，再重新连接。</p></Panel>{isPublicBuild && <LocalEngine recovery/>}</div>;
+    if (session.loading) return <div className="app-loading"><strong>SINGULARITYX · 零界演化</strong><Loading/></div>;
+    if (session.error) return <div className="login-screen"><Panel title="连接研究服务"><ErrorBox message={session.error} retry={session.refresh}/><p className="muted padded">请确认后台服务已启动，再重新连接。</p></Panel>{isPublicBuild && <PageBoundary><Suspense fallback={<Loading/>}><LocalEngine recovery/></Suspense></PageBoundary>}</div>;
     if (!session.data?.authenticated && !['development', 'public'].includes(session.data?.mode)) return <Login onSuccess={session.refresh}/>;
     return <div className={'app-shell reference-shell ' + (sidebar ? 'sidebar-open ' : '') + (collapsed ? 'sidebar-collapsed' : '')}>
         <aside className="sidebar"><a href="#/factors" className="brand"><BrandLogo/><div><strong>SINGULARITYX</strong><small>零界演化</small></div></a>
             <nav aria-label="主导航">{navItems.map(item => <a key={item.path} title={item.label} href={'#' + item.path} className={current.path === item.path ? 'active' : ''}><item.icon size={21}/><span>{item.label}</span></a>)}</nav>
             <button className="sidebar-collapse" aria-label={collapsed ? '展开侧栏' : '收起侧栏'} onClick={() => setCollapsed(!collapsed)}>{collapsed ? <ChevronRight size={19}/> : <ChevronLeft size={19}/>}</button>
-            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.5.2</small></div>
+            <div className="sidebar-bottom"><span>{modeLabel}</span><small>v0.5.3</small></div>
         </aside>{sidebar && <button className="sidebar-shade" aria-label="关闭导航" onClick={() => setSidebar(false)}/>}
         <div className="main-shell"><header className="topbar"><div className="breadcrumb"><button className="icon-button menu-button" aria-label="展开导航" onClick={() => setSidebar(!sidebar)}><Menu size={20}/></button><a href="#/factors">首页</a><span>/</span><strong>{current.label}</strong></div><div className="topbar-right"><a href="#/engine" className="text-button" title="切换公开样本与本机完整数据"><Tag tone="amber">{modeLabel}</Tag></a><Tag tone="green"><current.icon size={13}/>{current.label}</Tag>{!isPublic && !['development', 'local_bridge'].includes(session.data?.mode) && <button title="退出登录" className="icon-button" onClick={async () => { try { await api('/logout', 'POST'); session.refresh(); } catch (e) { notify(errorMessage(e)); } }}><LogOut size={16}/></button>}</div></header>
             <main key={path} className="workspace">
-                {path === '/factors' ? <FactorLibrary publicMode={isPublic}/> : path.startsWith('/factors/') ? <FactorDetail key={path} id={decodeURIComponent(path.slice(9))} notify={notify}/> : path === '/research' ? <ResearchForm publicMode={isPublic} kind="factor" initialFactor={params.get('factor') || undefined} notify={notify}/> : path === '/strategies' ? <ResearchForm publicMode={isPublic} kind="strategy" notify={notify}/> : path === '/runs' ? <Runs/> : path.startsWith('/runs/') ? <RunDetail publicMode={isPublic} id={decodeURIComponent(path.slice(6))} notify={notify}/> : path === '/reports' ? <Reports initialRun={params.get('run') || undefined} notify={notify}/> : path === '/data' ? <DataQuality publicMode={isPublic}/> : path === '/replication' ? <ReplicationPipeline notify={notify}/> : path === '/events' ? <EventResearch notify={notify}/> : path === '/operators' ? <OperatorLibrary notify={notify}/> : path === '/ipo' ? <IpoCalculator notify={notify}/> : path === '/engine' ? <LocalEngine/> : path === '/system' ? <SystemStatus notify={notify}/> : <Empty title="页面不存在" action={<button className="button" onClick={() => go('/factors')}>返回因子研究</button>}/>}
-                <footer className="workspace-footer"><span>SINGULARITYX 零界演化</span><span>{isPublic ? '公开研究版 · 浏览器本机保存 · 不与其他设备自动同步' : '真实研究结果 · 历史表现不代表未来收益'}</span></footer>
+                <PageBoundary key={path}><Suspense fallback={<Loading/>}>{path === '/factors' ? <FactorLibrary publicMode={isPublic}/> : path.startsWith('/factors/') ? <FactorDetail key={path} id={decodeURIComponent(path.slice(9))} notify={notify}/> : path === '/research' ? <ResearchForm publicMode={isPublic} kind="factor" initialFactor={params.get('factor') || undefined} notify={notify}/> : path === '/strategies' ? <ResearchForm publicMode={isPublic} kind="strategy" notify={notify}/> : path === '/runs' ? <Runs/> : path.startsWith('/runs/') ? <RunDetail publicMode={isPublic} id={decodeURIComponent(path.slice(6))} notify={notify}/> : path === '/reports' ? <Reports initialRun={params.get('run') || undefined} notify={notify}/> : path === '/data' ? <DataQuality publicMode={isPublic}/> : path === '/replication' ? <ReplicationPipeline notify={notify}/> : path === '/events' ? <EventResearch notify={notify}/> : path === '/operators' ? <OperatorLibrary notify={notify}/> : path === '/ipo' ? <IpoCalculator notify={notify}/> : path === '/engine' ? <LocalEngine/> : path === '/system' ? <SystemStatus notify={notify}/> : <Empty title="页面不存在" action={<button className="button" onClick={() => go('/factors')}>返回因子研究</button>}/>}
+                </Suspense></PageBoundary><footer className="workspace-footer"><span>SINGULARITYX 零界演化</span><span>{isPublic ? '公开研究版 · 浏览器本机保存 · 不与其他设备自动同步' : '真实研究结果 · 历史表现不代表未来收益'}</span></footer>
             </main>
         </div>{toast && <div role="status" className="toast"><Check size={17}/>{toast}<button aria-label="关闭提示" className="icon-button" onClick={() => setToast('')}><X size={14}/></button></div>}
     </div>;

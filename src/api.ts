@@ -59,6 +59,8 @@ export async function connectLocalEngine(address: string, pairing: string) {
 export function disconnectLocalEngine() { sessionStorage.removeItem(CONNECTION_KEY); window.location.hash = '/engine'; window.location.reload(); }
 export async function api<T = RecordData>(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<T> {
     if (isPublicMode) {
+        // Public identity does not require catalog downloads or browser-database initialization.
+        if (path === '/session' && method === 'GET') return { mode: 'public', authenticated: true, username: '本机研究员', role: 'researcher', storage_initialization: 'on_demand', note: '公开研究版 · 研究记录按需读取并保存在当前浏览器' } as T;
         const { publicRequest } = await import('./publicApi');
         try { return await publicRequest(path, method, body, signal) as T; }
         catch (error) { if (error instanceof DOMException && error.name === 'AbortError') throw error; throw new ApiError(error instanceof Error ? error.message : String(error), typeof (error as any)?.status === 'number' ? (error as any).status : 422); }
